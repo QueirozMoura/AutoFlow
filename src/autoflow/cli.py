@@ -6,12 +6,16 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from autoflow.commands.status import status
+
 app = typer.Typer(
     name="autoflow",
     help="AutoFlow CLI: modular Linux automation and system administration.",
     add_completion=False,
     rich_markup_mode="rich",
 )
+
+app.command()(status)
 
 
 def _show_version(value: bool) -> None:

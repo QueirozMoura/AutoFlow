@@ -5,8 +5,9 @@
 AutoFlow CLI targets Linux automation and system administration using Python
 3.12+. This document describes the intended architecture. At this stage, the
 repository contains packaging configuration, documentation, reserved module
-boundaries, and a Typer application with help and version options. Rich provides
-terminal presentation. No system commands or operations are implemented.
+boundaries, and a Typer application with help, version, and read-only `status`.
+Rich provides terminal presentation; `status --json` supports machine consumers.
+No system-changing operations are implemented.
 
 ## Module responsibilities
 
@@ -14,6 +15,9 @@ terminal presentation. No system commands or operations are implemented.
 | --- | --- |
 | `src/autoflow/cli.py` | Compose the Typer application and expose `main` |
 | `src/autoflow/commands/` | Parse command-specific input and coordinate use cases |
+| `src/autoflow/commands/status.py` | Invoke collection, serialize JSON, and render a Rich snapshot |
+| `src/autoflow/core/system.py` | Collect typed read-only snapshots using psutil and standard library OS metadata |
+| `src/autoflow/core/health.py` | Classify raw percentages using 70% and 90% thresholds |
 | `src/autoflow/core/` | Own application rules, use cases, and adapter contracts |
 | `src/autoflow/integrations/` | Implement Linux, psutil, and external-process adapters |
 | `tests/` | Verify behavior with unit tests and controlled integration tests |
@@ -36,13 +40,32 @@ CLI composition → command groups → core use cases and contracts
        └── integration adapters ──────────┘
 ```
 
-The CLI composition layer will supply concrete adapters to use cases. Core
-logic must not depend on Typer, Rich, Bash, or concrete Linux adapters.
+The CLI registers `status` centrally. Its command function delegates to
+`collect_system_status`, then selects JSON serialization or `render_status`.
+The collector returns typed dataclasses without terminal dependencies. At this
+stage, `core/system.py` reads psutil directly; future adapters can be extracted
+when additional use cases require them. OS identity uses `freedesktop_os_release`
+and hostname uses the standard library because psutil does not provide those fields.
+
+Future CLI composition will supply concrete adapters to use cases. Core
+logic must not depend on Typer, Rich, or Bash.
 Integrations may depend on contracts defined in the core. Command groups will
 handle terminal presentation with Rich while delegating application decisions
 to the core. Additional modules should be created only when a feature needs them.
 
 ## Execution model
+
+Status reads each field independently. Expected OS and psutil failures produce
+`None` and a field-specific error, preserving successful readings. JSON uses
+dataclass serialization and plain stdout, with bytes and seconds as numeric
+units; it never passes through Rich. Any read failure yields exit code 1 after
+output, including for JSON. A complete snapshot yields exit code 0.
+
+CPU uses a bounded 0.1-second psutil sample, avoiding the meaningless initial
+nonblocking reading. RAM used is total minus available, matching psutil's
+percentage. The disk target is the filesystem mounted at `/`. Presentation
+formats byte counts in binary units and uptime as days, hours, minutes, seconds.
+Pure threshold classification is separate from collection and color mapping.
 
 A future command will validate arguments, invoke a core use case with explicit
 dependencies, and render the result. Adapters will perform external I/O and
@@ -87,8 +110,8 @@ with a documented Python version matrix. Empty directories are tracked with
 
 ## Staged evolution
 
-The CLI foundation and basic interface tests are in place. Next define system
-command contracts and CI checks, then add read-only metrics and system
-inspection. Introduce automation only after adapter boundaries and operational
+The CLI foundation, read-only status snapshot, and mocked metric tests are in
+place. Next add CI checks and define further command contracts.
+Introduce automation only after adapter boundaries and operational
 safeguards have been tested. Dependency locking, release automation, configuration
 storage, and additional subsystems remain future design decisions.

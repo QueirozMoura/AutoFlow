@@ -5,9 +5,9 @@ administration, developed primarily in Python. It aims to provide a modular,
 maintainable command-line interface with readable terminal output and explicit
 control over operations that affect the system.
 
-**Status: CLI foundation.** Typer provides help and version options with Rich
-terminal presentation. No system operations, metrics collection, or Bash
-integrations are implemented.
+**Status: read-only system status.** Typer provides help, version, and a `status`
+command with a Rich dashboard or plain JSON output. System-changing operations
+and Bash integrations are not implemented.
 
 ## Technology stack
 
@@ -37,8 +37,8 @@ versions will be verified as implementations and CI are added.
 │   └── autoflow/
 │       ├── __init__.py
 │       ├── cli.py        # Typer application and console entry point
-│       ├── commands/     # Future Typer command groups
-│       ├── core/         # Future application logic
+│       ├── commands/     # Status command and terminal presentation
+│       ├── core/         # System snapshots and utilization thresholds
 │       └── integrations/ # Future Linux and process adapters
 ├── tests/                # CLI interface tests
 ├── .gitignore
@@ -74,10 +74,34 @@ With the environment activated, try the CLI:
 ```bash
 autoflow --help
 autoflow --version
+autoflow status
+autoflow status --json
 ```
 
 Running `autoflow` without arguments also displays help. The version comes from
 the installed package metadata, using `pyproject.toml` as the source of truth.
+
+## System status
+
+`autoflow status` displays the Linux distribution name and version, hostname,
+uptime, CPU usage, RAM usage, and usage of the filesystem mounted at `/`.
+CPU is sampled for 100 ms. RAM used is `total - available`, consistent with
+psutil's memory percentage; reclaimable cache counts as available. Disk usage
+and percentage are reported by psutil, including its treatment of reserved space.
+
+The dashboard uses green for usage below 70%, yellow for 70% to below 90%, and
+red for 90% or above. Classification uses the unrounded measurement. Labels
+remain visible when colors are disabled.
+
+`autoflow status --json` emits a single JSON object, including when redirected
+or piped, with no ANSI formatting. Fields are `operating_system` (`name`,
+`version`), `hostname`, `uptime_seconds`, `cpu_percent`, `memory` and `disk`
+(`percent`, `used_bytes`, `total_bytes`), `disk_path`, and `errors`.
+
+Successful snapshots exit with code 0. If a read fails, other metrics remain
+available, the failed field becomes `null` in JSON or `Unavailable` in the
+dashboard, and `errors` maps field names to read errors. The command exits with
+code 1 while still emitting the snapshot. No elevated privileges are required.
 
 The package uses the `src/` layout; install it in the development environment
 before running package tests. Quality checks are:
@@ -88,7 +112,8 @@ python -m ruff format --check .
 python -m pytest
 ```
 
-Tests cover help, version, invocation without arguments, and invalid input.
+Tests cover the base CLI, mocked metric reads and failures, utilization
+boundaries, dashboard rendering, and plain JSON output.
 CI workflows remain a future stage. Runtime dependencies and development tools are declared in
 `pyproject.toml`; reproducible dependency locking is deferred to the CI stage.
 
@@ -108,7 +133,7 @@ The ignore rules are a convenience, not a substitute for reviewing staged files.
 - [x] Establish the Typer application with help and version options.
 - [x] Add basic CLI interface tests.
 - [ ] Define initial system command contracts and add GitHub Actions quality checks.
-- [ ] Introduce read-only system inspection and metrics.
+- [x] Introduce read-only system inspection and metrics with `status` and JSON output.
 - [ ] Add carefully scoped automation and Bash integrations.
 - [ ] Document supported distributions, operational safeguards, and release procedures.
 
