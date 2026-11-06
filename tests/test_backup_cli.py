@@ -41,7 +41,10 @@ def test_human_backup(source: Path, tmp_path: Path) -> None:
     assert "Original size" in result.stdout
     assert "Compressed size" in result.stdout
     assert "Duration" in result.stdout
-    assert len(list((tmp_path / "backups").glob("*.tar.gz"))) == 1
+    archives = list((tmp_path / "backups").glob("*.tar.gz"))
+    assert len(archives) == 1
+    # Long generated names must remain visible even on narrow terminals.
+    assert archives[0].name in "".join(result.stdout.replace("│", "").split())
 
 
 def test_json_result(source: Path, tmp_path: Path) -> None:

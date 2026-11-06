@@ -18,6 +18,8 @@ from autoflow.core.backup import BackupError, BackupResult, create_backup
 
 def _render_result(result: BackupResult, console: Console) -> None:
     table = Table.grid(padding=(0, 2))
+    table.add_column(no_wrap=True)
+    table.add_column(overflow="fold")
     table.add_row("Source", Text(result.source))
     table.add_row("Output", Text(result.output))
     table.add_row("Files", str(result.file_count))

@@ -7,8 +7,8 @@ AutoFlow CLI targets Linux automation and system administration using Python
 repository contains packaging configuration, documentation, reserved module
 boundaries, and a Typer application with help, version, and read-only `status`.
 Rich provides terminal presentation; JSON supports machine consumers. `backup`
-creates archives in an explicit destination. Restoration and scheduling are
-outside the current scope.
+creates archives in an explicit destination. `restore` validates untrusted
+archives and publishes a new directory atomically. Scheduling is outside scope.
 
 ## Module responsibilities
 
@@ -21,6 +21,8 @@ outside the current scope.
 | `src/autoflow/core/health.py` | Classify raw percentages using 70% and 90% thresholds |
 | `src/autoflow/commands/backup.py` | Parse backup options, render progress/results, and serialize JSON/errors |
 | `src/autoflow/core/backup.py` | Discover safe entries, validate consistency, and create/publish archives |
+| `src/autoflow/commands/restore.py` | Parse restore limits, render progress/previews, and serialize results/errors |
+| `src/autoflow/core/restore.py` | Bound and validate untrusted archives, stage contents, and publish a new directory |
 | `src/autoflow/core/` | Own application rules, use cases, and adapter contracts |
 | `src/autoflow/integrations/` | Implement Linux, psutil, and external-process adapters |
 | `tests/` | Verify behavior with unit tests and controlled integration tests |
@@ -122,14 +124,16 @@ The core performs these steps:
    Any detected inconsistency aborts.
 7. Close gzip/tar output, flush and fsync the temporary file, then verify that the
    destination path still identifies the open destination directory and recheck
-   its ownership and write permissions. Publish via
+   its ownership and write permissions. Check that the temporary name still
+   identifies the completed stream's inode and metadata. Publish via
    Linux `renameat2(RENAME_NOREPLACE)` exposed through standard-library `ctypes`.
    Timestamp/UUID names are retried on collisions; neither pre-checks followed by
    ordinary rename nor overwriting fallbacks are used. Unsupported atomic rename
    semantics fail closed.
 8. On failure/cancellation, unlink only the temporary name exclusively created
    by this invocation, through its pinned destination descriptor. Existing
-   archives are untouched. Cleanup errors are explicit; newly created destination
+   archives are untouched. Verify temporary inode ownership before unlinking;
+   report replaced names without removing them. Cleanup errors are explicit; newly created destination
    directories may remain. Return a successful result only after publication.
 
 Archive names are relative and rooted at the source basename. JSON uses only
@@ -142,10 +146,68 @@ This implementation targets Linux with readable mountinfo and support for atomic
 no-replace renames. It is not a snapshot mechanism: quiescent sources and trusted
 destination directories are required for strong consistency. Metadata checks
 cannot eliminate the interval after validation or malicious metadata concealment.
-No encryption, ACL/xattr preservation, sparse-file preservation, restoration, or
-scheduling is provided. Original data is not written, but normal access-time
+Backup creation provides no encryption, ACL/xattr preservation, sparse-file
+preservation, or scheduling. Original data is not written, but normal access-time
 updates may occur. SIGKILL or power loss can leave temporary files, and syncing
 the archive does not promise full power-loss durability of directory entries.
+
+### Restore execution and trust boundaries
+
+`restore_backup` returns a typed `RestoreResult` and raises `RestoreError` on
+expected failures. The command owns Typer, Rich, and JSON presentation; the core
+has no terminal dependencies and runs no processes. Existing Linux descriptor,
+metadata-signature, and no-replace rename helpers are reused from `core/backup.py`.
+
+1. Normalize paths, reject protected destinations, and open archive/destination
+   parents component by component without following symlinks. Require an absent
+   output and an existing, user-owned parent with no group/other write bits.
+   Walk the destination ancestry to reject untrusted ownership and shared writable
+   ancestors, allowing system-owned sticky directories such as `/tmp`. The root
+   directory's owner identifies the system owner even in mapped user namespaces.
+2. Open a regular archive with `O_NOFOLLOW` and retain its descriptor and metadata
+   signature. Perform a complete read-only validation pass before creating staging.
+   `_SafeTarInfo` checks extension sizes before inherited tarfile metadata parsing;
+   `_BoundedGzip` bounds individual reads and all decompressed offsets, including
+   seeks. The subclass uses tarfile's header/extension processing hook and requires
+   compatibility checks when upgrading Python.
+3. Validate effective member names (including PAX overrides), types, declared sizes,
+   duplicates, and file/directory conflicts. Reject absolute paths, dot/parent/empty
+   components, backslashes, control characters, links, sparse and special entries.
+   Build an inventory counting implicit directories against `max_files` and file
+   bytes against `max_bytes`. Defaults: 10,000 entries, 10 GiB. Independently bound
+   metadata records (1 MiB), path bytes (4096), depth (128), trailing padding (1 MiB),
+   and total inflated framing (`max_bytes + max_files * 8192 + 1048576`). Read every
+   regular payload and require two zero tar end records, only bounded zero padding,
+   valid gzip CRC, and EOF. Dry-run returns now without filesystem writes.
+4. Create a private sibling staging directory exclusively, tracking ownership only
+   after `mkdir` succeeds. Validate and stream the archive a second time. Create
+   directories with `0700` and files with `0600` using anchored directory descriptors,
+   `O_NOFOLLOW`, and `O_EXCL`. Do not call tarfile extraction APIs; `extractfile`
+   only supplies streams for previously validated regular entries. Do not apply
+   archive permissions, owners, or timestamps. Sync each completed file.
+5. Compare inventories and archive metadata, reopen the destination parent and
+   recheck its identity, ownership, and ancestry. Publish the complete staging tree
+   using `renameat2(RENAME_NOREPLACE)`. The output never exposes an in-progress
+   restore, and concurrent outputs are never overwritten. Unsupported rename
+   semantics fail closed. No merging into an existing directory is supported.
+6. On failure or ordinary cancellation, clean only the staging name this invocation
+   created, using descriptor-relative, symlink-resistant `shutil.rmtree`. Report
+   cleanup errors explicitly. If publication succeeds, stop treating the directory
+   as temporary. Return success only after the atomic rename.
+
+JSON success contains `success`, `dry_run`, absolute `archive`/`output`, file
+count, total logical bytes, duration, entry lists, and configured limits. JSON
+operational errors contain `success: false`, `dry_run`, and `error`; success/error
+exit codes are 0/1. Typer usage errors retain code 2 and its standard formatting.
+Human progress goes to stderr and is disabled for JSON/previews.
+
+The archive is not authenticated by CRC and resource limits impose no CPU quota.
+The archive is read twice; staging needs the full expanded disk space. Memory
+holds bounded metadata/inventories, while payloads stream in 64 KiB blocks.
+Input contents are never modified, though reads may update atime. This is not a
+snapshot or a defense against root/same-credential attackers changing files,
+mounts, or permissions during execution. SIGKILL/power loss can leave staging;
+directory publication is atomic but full crash durability is not guaranteed.
 
 ### Future process integrations
 
@@ -179,6 +241,10 @@ compare contents without extracting into personal folders. Failure injection
 covers read permissions, compression, disk-full conditions, rename support,
 concurrent name collisions, source mutation, destination replacement, and temp
 cleanup. A subprocess test validates the installed CLI with piped JSON stdout.
+Restore unit and CLI tests add hostile member paths/types, metadata-size attacks,
+PAX overrides, archive/gzip corruption, limits, concurrent publication, original
+integrity, permission policy, and failure/cancellation cleanup. End-to-end tests
+create backups and restore them using only `tmp_path` resources.
 
 Ruff is configured in `pyproject.toml` for linting and formatting with a Python
 3.12 target. Future CI will run lint, format checks, and meaningful tests on Linux
@@ -187,9 +253,9 @@ with a documented Python version matrix. Empty directories are tracked with
 
 ## Staged evolution
 
-The CLI foundation, read-only status snapshot, and safe backup creation with
+The CLI foundation, read-only status snapshot, safe backup creation and restoration with
 temporary-fixture tests are in place. Next add CI checks and define further
-command contracts; restoration and scheduling require separate design stages.
+command contracts; scheduling requires a separate design stage.
 Introduce automation only after adapter boundaries and operational
 safeguards have been tested. Dependency locking, release automation, configuration
 storage, and additional subsystems remain future design decisions.

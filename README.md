@@ -5,10 +5,10 @@ administration, developed primarily in Python. It aims to provide a modular,
 maintainable command-line interface with readable terminal output and explicit
 control over operations that affect the system.
 
-**Status: system status and backup creation.** Typer provides help, version,
-read-only `status`, and safe `.tar.gz` backup creation. Both commands support
-Rich terminal output and plain JSON. Restoration, scheduling, and Bash
-integrations are not implemented.
+**Status: system status, backup creation, and safe restoration.** Typer provides
+help, version, read-only `status`, `.tar.gz` backup creation, and validated
+restoration into new directories. Commands support Rich output and plain JSON.
+Scheduling and Bash integrations are not implemented.
 
 ## Technology stack
 
@@ -38,8 +38,8 @@ versions will be verified as implementations and CI are added.
 │   └── autoflow/
 │       ├── __init__.py
 │       ├── cli.py        # Typer application and console entry point
-│       ├── commands/     # Status/backup commands and terminal presentation
-│       ├── core/         # System metrics, thresholds, and backup operations
+│       ├── commands/     # Status/backup/restore commands and terminal presentation
+│       ├── core/         # System metrics, thresholds, backup and restore operations
 │       └── integrations/ # Future Linux and process adapters
 ├── tests/                # CLI interface tests
 ├── .gitignore
@@ -171,6 +171,8 @@ as read failures; inspect `skipped` when complete coverage matters.
   fallback. Only this invocation's temporary file is removed on failure or
   ordinary cancellation. Existing backups are retained. Newly created empty
   destination directories may remain after failure.
+  Temporary-file identity is verified before publication and cleanup; a replaced
+  name is neither published nor deleted, and the conflict is reported.
 - This is a file-level backup, not an atomic filesystem snapshot. Stop writers
   for consistency: changes after the final validation, or changes concealed by
   filesystem metadata behavior, cannot be ruled out. Do not rearrange mount
@@ -185,6 +187,77 @@ as read failures; inspect `skipped` when complete coverage matters.
   access timestamps as files and directories are read. Backups are not encrypted.
   Forced termination or power loss can leave a `.part` file; full crash durability
   is not guaranteed. Cleanup failures are reported explicitly.
+
+## Safe restoration
+
+```bash
+autoflow restore backup.tar.gz --output ~/Restaurados
+autoflow restore backup.tar.gz --output ~/Restaurados --dry-run
+autoflow restore backup.tar.gz --output ~/Restaurados --json
+autoflow restore backup.tar.gz --output ~/Restaurados --dry-run --json
+autoflow restore backup.tar.gz --output ~/Restaurados --max-files 20000 --max-bytes 21474836480
+autoflow restore --help
+```
+
+The destination **must not exist**, even as an empty directory, and its parent
+must already exist. No merging, replacement, or overwrite option is provided.
+A directory backup restores its original top-level basename under the output;
+single-file backups restore the basename directly under the output. Dry-run
+validates every entry and reads all file data, including the gzip checksum,
+without creating files, directories, or temporary storage. Reads can update atime.
+
+The default limits are **10,000 entries** and **10 GiB of uncompressed file data**.
+`--max-files` counts files and directories, including implicit parent directories;
+`--max-bytes` counts logical regular-file bytes and accepts zero for empty files.
+Limits apply to previews as well as actual restoration. Metadata records are
+limited to 1 MiB each, names to 4096 encoded bytes and 128 path components, and
+trailing zero padding to 1 MiB. Total decompressed framing (headers and padding)
+is limited to `max_bytes + max_files * 8192 + 1048576` bytes. These additional
+fixed safeguards can reject unusual but otherwise valid tar archives.
+
+Safety decisions:
+
+- Reject absolute paths, empty/dot/parent components, backslashes, control
+  characters, duplicate names, and file/directory conflicts. PAX path overrides
+  undergo the same validation. Reject symbolic links, hard links, sparse entries,
+  devices, FIFOs, and all other special member types.
+- Check tar headers, declared sizes, complete payloads, two zero tar end records,
+  trailing data, gzip CRC, and gzip EOF before any filesystem writes. CRC detects
+  accidental corruption; it does not authenticate the archive's author.
+- Validate again while writing into a private sibling `.autoflow-restore-*.part`
+  directory. All writes use validated path components and no-follow directory
+  descriptors, never `extract()` or `extractall()`. Only after validation and
+  file syncing succeeds is the whole prepared tree atomically renamed into place
+  using Linux `renameat2(RENAME_NOREPLACE)`. A concurrent destination wins and is
+  preserved; restoration fails without publishing its partial tree.
+- Require a destination parent owned by the current user without group/other
+  write permission. Ancestors must belong to the system root owner or current
+  user and cannot be shared writable directories, except system-owned sticky
+  directories such as `/tmp`. Symlink components and protected system destinations
+  (`/`, `/proc`, `/sys`, `/dev`, `/run` and their special subtrees) are rejected.
+- Directories request `0700`, files `0600`, subject to stricter umask. Archive
+  owners, permissions (including execute/setuid), and timestamps are not applied.
+  Input archives and existing files are never written or removed.
+- Permission, read/write, disk-full, checksum, limit, source-change, or publication
+  failures abort and remove the owned staging tree. Ordinary cancellation also
+  cleans up. Cleanup failures are explicit errors and can leave staging data.
+
+Rich shows validation/preparation progress and a summary with file count, bytes,
+and duration. JSON emits a single object without ANSI/progress messages, with
+`success`, `dry_run`, `archive`, `output`, `file_count`, `total_bytes`,
+`duration_seconds`, `files`, `directories`, `max_files`, and `max_bytes`.
+Operational failures emit `success: false`, `dry_run`, and `error`, exiting 1.
+Success exits 0. Invalid CLI syntax uses Typer's normal usage errors and exits 2.
+
+Limitations: Linux no-replace rename support is required. Staging needs space
+for the entire restored tree on the destination filesystem. Validation reads the
+archive twice and retains a bounded inventory in memory; file contents stream
+in 64 KiB chunks. Limits do not provide a CPU/time quota. Stop archive writers
+and avoid changing mounts or ancestor permissions while restoring. Metadata
+checks detect ordinary concurrent changes but do not provide a snapshot or
+isolation against root or hostile processes with the same user credentials.
+SIGKILL or power loss may leave staging data; atomic publication does not promise
+full power-loss durability. No scheduling is included.
 
 ## Quality checks
 
@@ -201,6 +274,9 @@ Tests cover the base CLI, mocked metric reads and failures, utilization
 boundaries, dashboard rendering, and plain JSON output. Backup tests use only
 temporary fixtures and cover archive content, source integrity, exclusions,
 concurrent publication, change detection, permission errors, and failure cleanup.
+Restore tests additionally cover hostile paths/types/PAX metadata, gzip and tar
+corruption, configurable limits, atomic publication races, restrictive permissions,
+cleanup failures, dry-run, and CLI integration using `tmp_path` only.
 CI workflows remain a future stage. Runtime dependencies and development tools are declared in
 `pyproject.toml`; reproducible dependency locking is deferred to the CI stage.
 
@@ -222,7 +298,8 @@ The ignore rules are a convenience, not a substitute for reviewing staged files.
 - [ ] Define initial system command contracts and add GitHub Actions quality checks.
 - [x] Introduce read-only system inspection and metrics with `status` and JSON output.
 - [x] Create safe file and directory backups, previews, and structured JSON results.
-- [ ] Design restoration and scheduling in separate stages.
+- [x] Restore validated backups atomically into new directories with bounded resource usage.
+- [ ] Design scheduling in a separate stage.
 - [ ] Add carefully scoped automation and Bash integrations.
 - [ ] Document supported distributions, operational safeguards, and release procedures.
 
