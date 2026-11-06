@@ -8,6 +8,7 @@ from rich.console import Console
 
 from autoflow.commands.backup import backup
 from autoflow.commands.logs import logs
+from autoflow.commands.organize import organize
 from autoflow.commands.restore import restore
 from autoflow.commands.status import status
 
@@ -22,6 +23,7 @@ app.command()(status)
 app.command()(backup)
 app.command()(restore)
 app.command()(logs)
+app.command()(organize)
 
 
 def _show_version(value: bool) -> None:
