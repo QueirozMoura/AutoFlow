@@ -21,6 +21,7 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(subprocess, "Popen", Mock(side_effect=AssertionError("process attempted")))
     monkeypatch.setattr(os, "system", Mock(side_effect=AssertionError("shell attempted")))
 
@@ -259,6 +260,18 @@ def test_dry_run_never_calls_installer(paths, unit_directory, monkeypatch) -> No
     assert result.exit_code == 0
     installer.assert_not_called()
     assert list(unit_directory.iterdir()) == []
+
+
+def test_install_uses_xdg_config_home(paths, tmp_path, monkeypatch) -> None:
+    configured = tmp_path / "alternate config"
+    directory = configured / "systemd" / "user"
+    directory.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(configured))
+    result = runner.invoke(app, arguments(*paths)[:-1] + ["--install", "--yes"])
+    assert result.exit_code == 0, result.output
+    plan = core.plan_backup_schedule(*paths, "daily")
+    assert (directory / plan.timer.name).read_text() == plan.timer.content
+    assert not (tmp_path / "home/.config").exists()
 
 
 @pytest.mark.parametrize("kind", ["missing", "file", "inside", "same", "protected", "symlink"])

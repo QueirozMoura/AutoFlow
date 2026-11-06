@@ -25,6 +25,7 @@ from autoflow.core.backup import (
     _absolute,
     _directory,
     _safe_archive_path,
+    _signature,
     _validate_output,
 )
 
@@ -299,14 +300,87 @@ class ScheduleActivationResult:
     partial_activation_possible: bool = False
 
 
-def activate_backup_schedule(plan: BackupSchedulePlan) -> ScheduleActivationResult:
+def user_unit_directory() -> Path:
+    """Locate user configuration without creating it; reject unsafe XDG paths."""
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(configured) if configured else Path.home() / ".config"
+    if not base.is_absolute():
+        raise SchedulerError("XDG_CONFIG_HOME must be an absolute path")
+    return _path(base / "systemd" / "user", "unit directory")
+
+
+def _installed_unit_state(plan: BackupSchedulePlan, directory: Path) -> tuple[tuple[int, ...], ...]:
+    """Bind activation to owned, unchanged regular files matching the validated plan."""
+    with _directory(directory) as directory_fd:
+        _validate_output(directory_fd)
+        identities = [_signature(os.fstat(directory_fd))]
+        for unit in (plan.service, plan.timer):
+            descriptor = os.open(
+                unit.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+            with os.fdopen(descriptor, "rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & 0o022
+                    or metadata.st_nlink != 1
+                ):
+                    raise SchedulerError(f"Unsafe installed unit: {unit.name}")
+                expected = unit.content.encode("utf-8")
+                if stream.read(len(expected) + 1) != expected:
+                    raise SchedulerError(f"Installed unit differs from validated plan: {unit.name}")
+                signature = _signature(metadata)
+                current = os.stat(unit.name, dir_fd=directory_fd, follow_symlinks=False)
+                if signature != _signature(current) or signature != _signature(
+                    os.fstat(descriptor)
+                ):
+                    raise SchedulerError(f"Installed unit changed while reading: {unit.name}")
+                identities.append(signature)
+        return tuple(identities)
+
+
+def _verify_loaded_unit(output: str, unit: SystemdUnit, directory: Path) -> None:
+    """Fail closed on missing/ambiguous properties, aliases, overrides or stale units."""
+    properties: dict[str, str] = {}
+    if not isinstance(output, str):
+        raise SchedulerError(f"Inconclusive systemd query: {unit.name}")
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in properties:
+            raise SchedulerError(f"Ambiguous systemd query: {unit.name}")
+        properties[key] = value
+    expected = {
+        "Id": unit.name,
+        "LoadState": "loaded",
+        "FragmentPath": str(directory / unit.name),
+        "DropInPaths": "",
+        "NeedDaemonReload": "no",
+    }
+    if properties != expected:
+        raise SchedulerError(
+            f"Systemd configuration differs or is inconclusive for {unit.name}: "
+            "expected the validated fragment, no drop-ins, and a current loaded unit"
+        )
+
+
+def activate_backup_schedule(
+    plan: BackupSchedulePlan, *, unit_directory: Path | None = None
+) -> ScheduleActivationResult:
     """Reload the user manager and enable/start exactly the plan's timer.
 
     Validate a literal timer basename and its matching user service before any
     subprocess. Each command has a 30-second timeout, no shell and no stdin.
-    Installation must already have been performed separately. This function
-    cannot verify installed unit contents or which search path systemd resolves;
-    the caller must ensure the intended units are installed in its user manager.
+    Installation must already have been performed separately. After reload,
+    query both units' effective fragments, drop-ins, identity and reload status.
+    Require the exact validated files and no overrides, regardless of systemd
+    search precedence. The default directory honors XDG_CONFIG_HOME. Query
+    failures or inconclusive responses prevent enable/start. File metadata and
+    contents are checked before reload and again before enable/start.
+    These checks do not provide atomic isolation against concurrent file or
+    manager changes after verification; stop other configuration writers.
     Failure after enable/start begins can leave a timer enabled and/or active,
     including after a timeout kills the client. No disable, stop, removal, retry
     or rollback is attempted, and preexisting timer state is never inferred.
@@ -329,13 +403,49 @@ def activate_backup_schedule(plan: BackupSchedulePlan) -> ScheduleActivationResu
             ("Invalid user backup timer name or mismatched service in schedule plan",),
         )
 
-    for stage, arguments in (
-        ("daemon-reload", ["systemctl", "--user", "daemon-reload"]),
-        ("enable --now", ["systemctl", "--user", "enable", "--now", timer]),
+    try:
+        directory = (
+            user_unit_directory()
+            if unit_directory is None
+            else _path(unit_directory, "unit directory")
+        )
+        original = _installed_unit_state(plan, directory)
+    except (SchedulerError, BackupError, OSError, ValueError, RuntimeError) as exc:
+        return ScheduleActivationResult(False, timer, (f"Cannot validate installed units: {exc}",))
+
+    queries = [
+        (
+            f"show {unit.name}",
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "--no-pager",
+                "--all",
+                "--property=Id",
+                "--property=LoadState",
+                "--property=FragmentPath",
+                "--property=DropInPaths",
+                "--property=NeedDaemonReload",
+                unit.name,
+            ],
+            unit,
+        )
+        for unit in (plan.service, plan.timer)
+    ]
+    for stage, arguments, unit in (
+        ("daemon-reload", ["systemctl", "--user", "daemon-reload"], None),
+        *queries,
+        ("enable --now", ["systemctl", "--user", "enable", "--now", timer], None),
     ):
-        partial = stage == "enable --now"
+        partial = False
         try:
-            subprocess.run(
+            if stage == "enable --now":
+                if _installed_unit_state(plan, directory) != original:
+                    raise SchedulerError("Installed units changed after reload; activation refused")
+                partial = True
+            # Set partial only when the enable/start process can actually begin.
+            result = subprocess.run(
                 arguments,
                 shell=False,
                 check=True,
@@ -345,6 +455,13 @@ def activate_backup_schedule(plan: BackupSchedulePlan) -> ScheduleActivationResu
                 stdin=subprocess.DEVNULL,
                 timeout=30,
             )
+            if unit is not None:
+                if result.stderr:
+                    raise SchedulerError(f"Systemd query reported diagnostics: {unit.name}")
+                _verify_loaded_unit(result.stdout, unit, directory)
+        except (SchedulerError, BackupError, ValueError, RuntimeError) as exc:
+            partial = False
+            message = f"Activation verification failed: {exc}"
         except (FileNotFoundError, PermissionError) as exc:
             partial = False
             message = f"systemctl --user {stage} could not start: {exc}"

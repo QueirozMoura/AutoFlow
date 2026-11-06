@@ -19,10 +19,10 @@ from autoflow.core.backup import BackupError, _directory, _validate_output
 from autoflow.core.scheduler import (
     BackupSchedulePlan,
     SchedulerError,
-    _path,
     activate_backup_schedule,
     install_backup_schedule,
     plan_backup_schedule,
+    user_unit_directory,
 )
 
 schedule = typer.Typer(help="Preview, install or explicitly activate backup schedules.")
@@ -62,7 +62,7 @@ def backup(
         )
     try:
         plan = plan_backup_schedule(source, output, every.value)
-        unit_directory = Path.home() / ".config" / "systemd" / "user" if install else None
+        unit_directory = user_unit_directory() if install else None
     except (SchedulerError, OSError, RuntimeError) as exc:
         Console(stderr=True).print(Text(str(exc), style="red"))
         raise typer.Exit(code=1) from exc
@@ -140,8 +140,8 @@ def _read_unit(directory_fd: int, name: str) -> str:
 def _load_installed_plan(timer: str, directory: Path) -> BackupSchedulePlan:
     """Recognize exact CLI-generated units, including their command-derived hash.
 
-    This is content validation, not proof of authorship. Other systemd search
-    paths and concurrent same-user modifications still require user control.
+    This is content validation, not proof of authorship. The core checks manager
+    precedence and drop-ins after reload; concurrent writers require isolation.
     """
     service = timer.removesuffix(".timer") + ".service"
     with _directory(directory) as directory_fd:
@@ -192,7 +192,7 @@ def activate(
             "Expected autoflow-backup-<16 lowercase hex digits>.timer", param_hint="timer"
         )
     try:
-        directory = _path(Path.home() / ".config" / "systemd" / "user", "unit directory")
+        directory = user_unit_directory()
         plan = _load_installed_plan(timer, directory)
         console = Console()
         table = Table.grid(padding=(0, 2))
@@ -230,7 +230,7 @@ def activate(
     ) as exc:
         Console(stderr=True).print(Text(f"Cannot activate schedule: {exc}", style="red"))
         raise typer.Exit(code=1) from exc
-    result = activate_backup_schedule(plan)
+    result = activate_backup_schedule(plan, unit_directory=directory)
     if not result.success:
         errors = Console(stderr=True)
         errors.print(Text(f"Timer activation failed: {timer}", style="red"))

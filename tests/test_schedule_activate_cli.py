@@ -20,6 +20,7 @@ def isolated(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(
         subprocess, "run", Mock(side_effect=AssertionError("real command attempted"))
     )
@@ -31,7 +32,9 @@ def isolated(tmp_path, monkeypatch):
 
 @pytest.fixture
 def activation(monkeypatch):
-    mocked = Mock(side_effect=lambda plan: core.ScheduleActivationResult(True, plan.timer.name, ()))
+    mocked = Mock(
+        side_effect=lambda plan, **kwargs: core.ScheduleActivationResult(True, plan.timer.name, ())
+    )
     monkeypatch.setattr(command, "activate_backup_schedule", mocked)
     return mocked
 
@@ -61,7 +64,7 @@ def test_confirmed_activation_uses_core(installed, activation, yes):
     result = runner.invoke(app, arguments(plan, yes=yes), input="y\n", env={"COLUMNS": "240"})
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
-    activation.assert_called_once_with(plan)
+    activation.assert_called_once_with(plan, unit_directory=directory)
     assert "Timer enabled and started" in result.stdout
     assert plan.timer.name in result.stdout and plan.service.name in result.stdout
     assert str(directory) in result.stdout
@@ -205,7 +208,7 @@ def test_generated_name_with_wrong_hash_rejected(installed, activation):
 
 @pytest.mark.parametrize("partial", [False, True])
 def test_activation_failure_and_partial_warning(installed, activation, partial):
-    plan, _ = installed
+    plan, directory = installed
     activation.side_effect = None
     activation.return_value = core.ScheduleActivationResult(
         False, plan.timer.name, ("systemctl failed [bold]",), partial
@@ -216,7 +219,7 @@ def test_activation_failure_and_partial_warning(installed, activation, partial):
     assert "systemctl failed [bold]" in result.stderr
     assert ("partially enabled and/or active" in result.stderr) is partial
     assert "Timer enabled and started" not in result.stdout
-    activation.assert_called_once_with(plan)
+    activation.assert_called_once_with(plan, unit_directory=directory)
 
 
 def test_changed_unit_after_confirmation_rejected(installed, activation, monkeypatch):
@@ -240,11 +243,67 @@ def test_systemd_escaped_paths_round_trip(installed, activation):
     assert core.install_backup_schedule(plan, directory).success
     result = runner.invoke(app, arguments(plan))
     assert result.exit_code == 0, result.output
-    activation.assert_called_once_with(plan)
+    activation.assert_called_once_with(plan, unit_directory=directory)
 
 
 def test_activate_help(activation):
     result = runner.invoke(app, ["schedule", "activate", "--help"])
     assert result.exit_code == 0
     assert "--yes" in result.output
+    activation.assert_not_called()
+
+
+@pytest.mark.parametrize("yes", [False, True])
+@pytest.mark.parametrize("outcome", ["valid", "fragment", "override", "query_error", "timeout"])
+def test_cli_checks_effective_manager_configuration(installed, monkeypatch, yes, outcome):
+    plan, directory = installed
+    calls = []
+
+    def respond(arguments, **kwargs):
+        assert kwargs["shell"] is False and kwargs["timeout"] == 30
+        calls.append(arguments)
+        output = ""
+        if "show" in arguments:
+            if outcome == "query_error":
+                raise subprocess.CalledProcessError(1, arguments, stderr="query failed")
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(arguments, 30)
+            name = arguments[-1]
+            fragment = directory / name if outcome != "fragment" else directory.parent / name
+            overrides = str(directory / "service.d/extra.conf") if outcome == "override" else ""
+            output = (
+                f"Id={name}\nLoadState=loaded\nFragmentPath={fragment}\n"
+                f"DropInPaths={overrides}\nNeedDaemonReload=no\n"
+            )
+        return subprocess.CompletedProcess(arguments, 0, output, "")
+
+    monkeypatch.setattr(subprocess, "run", respond)
+    result = runner.invoke(app, arguments(plan, yes=yes), input="y\n")
+    assert result.exit_code == (0 if outcome == "valid" else 1), result.output
+    assert ("Enable and start this timer?" in result.stdout) is (not yes)
+    enable_calls = [item for item in calls if "enable" in item]
+    assert enable_calls == (
+        [["systemctl", "--user", "enable", "--now", plan.timer.name]] if outcome == "valid" else []
+    )
+
+
+def test_activate_uses_xdg_directory(installed, activation, tmp_path, monkeypatch):
+    plan, original_directory = installed
+    configured = tmp_path / "xdg config"
+    directory = configured / "systemd" / "user"
+    directory.mkdir(parents=True, mode=0o700)
+    assert core.install_backup_schedule(plan, directory).success
+    # Validating the old default directory would fail, so this also checks precedence.
+    (original_directory / plan.timer.name).write_text("foreign unit")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(configured))
+    result = runner.invoke(app, arguments(plan))
+    assert result.exit_code == 0, result.output
+    activation.assert_called_once_with(plan, unit_directory=directory)
+
+
+def test_relative_xdg_path_is_rejected(installed, activation, monkeypatch):
+    plan, _ = installed
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/config")
+    result = runner.invoke(app, arguments(plan))
+    assert result.exit_code == 1
     activation.assert_not_called()
