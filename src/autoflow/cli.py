@@ -10,6 +10,7 @@ from autoflow.commands.backup import backup
 from autoflow.commands.logs import logs
 from autoflow.commands.organize import organize
 from autoflow.commands.restore import restore
+from autoflow.commands.schedule import schedule
 from autoflow.commands.status import status
 
 app = typer.Typer(
@@ -24,6 +25,7 @@ app.command()(backup)
 app.command()(restore)
 app.command()(logs)
 app.command()(organize)
+app.add_typer(schedule, name="schedule")
 
 
 def _show_version(value: bool) -> None:
