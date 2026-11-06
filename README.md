@@ -5,9 +5,9 @@ administration, developed primarily in Python. It aims to provide a modular,
 maintainable command-line interface with readable terminal output and explicit
 control over operations that affect the system.
 
-**Status: initial project scaffold.** No commands, system operations, metrics
-collection, or Bash integrations are implemented. The `autoflow` console entry
-point is reserved and currently performs no action.
+**Status: CLI foundation.** Typer provides help and version options with Rich
+terminal presentation. No system operations, metrics collection, or Bash
+integrations are implemented.
 
 ## Technology stack
 
@@ -36,11 +36,11 @@ versions will be verified as implementations and CI are added.
 ├── src/
 │   └── autoflow/
 │       ├── __init__.py
-│       ├── cli.py        # Reserved console entry point
+│       ├── cli.py        # Typer application and console entry point
 │       ├── commands/     # Future Typer command groups
 │       ├── core/         # Future application logic
 │       └── integrations/ # Future Linux and process adapters
-├── tests/                # Reserved for automated tests
+├── tests/                # CLI interface tests
 ├── .gitignore
 ├── LICENSE
 ├── README.md
@@ -59,11 +59,9 @@ not execute system operations.
 See [the architecture document](docs/architecture.md) for dependency boundaries,
 testing strategy, and security principles.
 
-## Development setup — future stage
+## Development setup
 
-This preparation stage does not install dependencies or create an environment.
-When development begins, from the repository root on a system with Python 3.12+
-and pip, the intended setup is:
+From the repository root on a system with Python 3.12+ and pip:
 
 ```bash
 python3 -m venv .venv
@@ -71,8 +69,18 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 ```
 
+With the environment activated, try the CLI:
+
+```bash
+autoflow --help
+autoflow --version
+```
+
+Running `autoflow` without arguments also displays help. The version comes from
+the installed package metadata, using `pyproject.toml` as the source of truth.
+
 The package uses the `src/` layout; install it in the development environment
-before running package tests. Planned quality checks are:
+before running package tests. Quality checks are:
 
 ```bash
 python -m ruff check .
@@ -80,9 +88,8 @@ python -m ruff format --check .
 python -m pytest
 ```
 
-No tests exist yet; pytest will report no tests collected and exit with code 5
-until the first tests are added. CI workflows will be introduced alongside
-meaningful tests. Runtime dependencies and development tools are declared in
+Tests cover help, version, invocation without arguments, and invalid input.
+CI workflows remain a future stage. Runtime dependencies and development tools are declared in
 `pyproject.toml`; reproducible dependency locking is deferred to the CI stage.
 
 ## Security principles
@@ -98,8 +105,9 @@ The ignore rules are a convenience, not a substitute for reviewing staged files.
 ## Roadmap
 
 - [x] Prepare packaging, module boundaries, tooling configuration, and documentation.
-- [ ] Define initial command contracts and establish the Typer application.
-- [ ] Add unit tests and GitHub Actions quality checks.
+- [x] Establish the Typer application with help and version options.
+- [x] Add basic CLI interface tests.
+- [ ] Define initial system command contracts and add GitHub Actions quality checks.
 - [ ] Introduce read-only system inspection and metrics.
 - [ ] Add carefully scoped automation and Bash integrations.
 - [ ] Document supported distributions, operational safeguards, and release procedures.

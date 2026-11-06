@@ -4,9 +4,9 @@
 
 AutoFlow CLI targets Linux automation and system administration using Python
 3.12+. This document describes the intended architecture. At this stage, the
-repository contains packaging configuration, documentation, empty module
-boundaries, and a no-op console entry point. No commands or system operations
-are implemented.
+repository contains packaging configuration, documentation, reserved module
+boundaries, and a Typer application with help and version options. Rich provides
+terminal presentation. No system commands or operations are implemented.
 
 ## Module responsibilities
 
@@ -23,6 +23,10 @@ are implemented.
 The installed package name is `autoflow-cli`; its Python import name is
 `autoflow`. Setuptools discovers packages below `src/`, and the `autoflow` console
 script resolves to `autoflow.cli:main`.
+
+The CLI callback handles global options and displays help when invoked without
+arguments. The eager `--version` option reads installed package metadata and
+exits successfully. CLI tests use Typer's `CliRunner` to validate this interface.
 
 ## Dependency direction
 
@@ -83,7 +87,8 @@ with a documented Python version matrix. Empty directories are tracked with
 
 ## Staged evolution
 
-First establish CLI contracts and tests, then add read-only metrics and system
+The CLI foundation and basic interface tests are in place. Next define system
+command contracts and CI checks, then add read-only metrics and system
 inspection. Introduce automation only after adapter boundaries and operational
 safeguards have been tested. Dependency locking, release automation, configuration
 storage, and additional subsystems remain future design decisions.

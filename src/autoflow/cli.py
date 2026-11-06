@@ -1,5 +1,43 @@
-"""Reserved console entry point for the future Typer application."""
+"""Compose the AutoFlow command-line interface."""
+
+from importlib.metadata import version
+from typing import Annotated
+
+import typer
+from rich.console import Console
+
+app = typer.Typer(
+    name="autoflow",
+    help="AutoFlow CLI: modular Linux automation and system administration.",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+
+
+def _show_version(value: bool) -> None:
+    if value:
+        Console().print(f"[bold cyan]AutoFlow CLI[/bold cyan] {version('autoflow-cli')}")
+        raise typer.Exit()
+
+
+@app.callback(invoke_without_command=True)
+def callback(
+    ctx: typer.Context,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            help="Show the installed version and exit.",
+            callback=_show_version,
+            is_eager=True,
+        ),
+    ] = False,
+) -> None:
+    """Handle global options and display help when no command is given."""
+    if ctx.invoked_subcommand is None:
+        Console().print(ctx.get_help(), markup=False, highlight=False)
 
 
 def main() -> None:
-    """Reserve the package entry point; no commands are implemented yet."""
+    """Run the installed console entry point."""
+    app()
