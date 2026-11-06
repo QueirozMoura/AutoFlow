@@ -178,6 +178,23 @@ def test_stale_plan_is_revalidated(installation):
     assert list(directory.iterdir()) == []
 
 
+def test_installation_and_activation_share_plan_validator(installation, monkeypatch):
+    plan, directory = installation
+    validator = Mock(side_effect=core.SchedulerError("shared validation rejected plan"))
+    process = Mock(side_effect=AssertionError("systemctl attempted"))
+    monkeypatch.setattr(core, "_validate_backup_schedule_plan", validator)
+    monkeypatch.setattr(subprocess, "run", process)
+    installed = core.install_backup_schedule(plan, directory)
+    activated = core.activate_backup_schedule(plan, unit_directory=directory)
+    assert not installed.success and not activated.success
+    assert all(
+        "shared validation rejected plan" in result.errors[0] for result in (installed, activated)
+    )
+    assert validator.call_count == 2
+    process.assert_not_called()
+    assert list(directory.iterdir()) == []
+
+
 @pytest.mark.parametrize("operation", ["timer_open", "fchmod", "write", "fsync", "directory_fsync"])
 def test_partial_failure_rolls_back_only_created_files(installation, monkeypatch, operation):
     plan, directory = installation

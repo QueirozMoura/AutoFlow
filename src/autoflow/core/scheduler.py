@@ -166,17 +166,31 @@ class ScheduleInstallResult:
     errors: tuple[str, ...]
 
 
-def _validate_install_plan(plan: BackupSchedulePlan) -> None:
-    """Accept only a complete, canonical plan from the existing planner."""
+def _validate_backup_schedule_plan(plan: BackupSchedulePlan) -> None:
+    """Share canonical-plan validation between installation and activation.
+
+    Reconstruct through the planner rather than duplicating command/unit rules.
+    Explicit unit stems supported by the planner remain valid, but names alone
+    never establish that a plan describes an AutoFlow backup. This validates
+    consistency and current metadata, not cryptographic proof of authorship.
+    """
     if (
         not isinstance(plan, BackupSchedulePlan)
+        or not isinstance(plan.source, Path)
+        or not isinstance(plan.output, Path)
+        or plan.scope != "user"
+        or not isinstance(plan.frequency, str)
         or not isinstance(plan.service, SystemdUnit)
         or not isinstance(plan.timer, SystemdUnit)
         or not isinstance(plan.service.name, str)
+        or not isinstance(plan.timer.name, str)
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,246}\.service", plan.service.name) is None
+        or plan.timer.name != plan.service.name.removesuffix(".service") + ".timer"
+        or not isinstance(plan.service.content, str)
+        or not isinstance(plan.timer.content, str)
         or not isinstance(plan.command, tuple)
         or len(plan.command) != 6
-        or not all(isinstance(argument, str) for argument in plan.command)
+        or not all(isinstance(argument, str) and argument for argument in plan.command)
     ):
         raise SchedulerError("Invalid backup schedule plan")
     expected = plan_backup_schedule(
@@ -210,7 +224,7 @@ def install_backup_schedule(
     errors: list[str] = []
     remaining: list[Path] = []
     try:
-        _validate_install_plan(plan)
+        _validate_backup_schedule_plan(plan)
         directory = _path(unit_directory, "unit directory")
         if directory == Path("/") or any(
             directory == protected or protected in directory.parents for protected in _PROTECTED
@@ -371,8 +385,8 @@ def activate_backup_schedule(
 ) -> ScheduleActivationResult:
     """Reload the user manager and enable/start exactly the plan's timer.
 
-    Validate a literal timer basename and its matching user service before any
-    subprocess. Each command has a 30-second timeout, no shell and no stdin.
+    Validate the complete plan against the planner before any subprocess.
+    Each command has a 30-second timeout, no shell and no stdin.
     Installation must already have been performed separately. After reload,
     query both units' effective fragments, drop-ins, identity and reload status.
     Require the exact validated files and no overrides, regardless of systemd
@@ -390,17 +404,13 @@ def activate_backup_schedule(
         if isinstance(plan, BackupSchedulePlan) and isinstance(plan.timer, SystemdUnit)
         else None
     )
-    if (
-        not isinstance(timer, str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,246}\.timer", timer) is None
-        or plan.scope != "user"
-        or not isinstance(plan.service, SystemdUnit)
-        or plan.service.name != timer.removesuffix(".timer") + ".service"
-    ):
+    try:
+        _validate_backup_schedule_plan(plan)
+    except SchedulerError as exc:
         return ScheduleActivationResult(
             False,
             timer if isinstance(timer, str) else None,
-            ("Invalid user backup timer name or mismatched service in schedule plan",),
+            (f"Invalid backup schedule plan: {exc}",),
         )
 
     try:

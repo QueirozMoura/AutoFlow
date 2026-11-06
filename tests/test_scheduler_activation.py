@@ -371,3 +371,143 @@ def test_invalid_xdg_path_prevents_all_commands(plan, process, monkeypatch):
     result = core.activate_backup_schedule(plan)
     assert not result.success and "absolute" in result.errors[0]
     process.assert_not_called()
+
+
+@pytest.mark.parametrize("frequency", ["daily", "weekly", "monthly"])
+def test_legitimate_plans_pass_shared_validation_and_activation(plan, process, frequency):
+    legitimate = core.plan_backup_schedule(
+        plan.source, plan.output, frequency, executable=Path(plan.command[0])
+    )
+    if legitimate != plan:
+        assert core.install_backup_schedule(legitimate, core.user_unit_directory()).success
+    assert core._validate_backup_schedule_plan(legitimate) is None
+    result = core.activate_backup_schedule(legitimate)
+    assert result.success, result.errors
+    assert process.call_args_list == expected_calls(legitimate.timer.name)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "foreign_names",
+        "foreign_units",
+        "empty_command",
+        "empty_arguments",
+        "list_command",
+        "short_command",
+        "extra_argument",
+        "non_string_argument",
+        "restore_command",
+        "source_argument",
+        "output_argument",
+        "output_flag",
+        "json_flag",
+        "relative_executable",
+        "service_content",
+        "timer_content",
+        "service_type",
+        "timer_target",
+        "service_override",
+        "timer_override",
+        "scope",
+        "frequency",
+        "frequency_mismatch",
+        "source_field",
+        "output_field",
+        "service_name_type",
+        "timer_name_type",
+        "service_content_type",
+        "timer_content_type",
+    ],
+)
+def test_tampered_plans_rejected_before_installed_checks_or_systemctl(
+    plan, process, monkeypatch, change
+):
+    arguments = list(plan.command)
+    if change == "empty_command":
+        altered = replace(plan, command=())
+    elif change == "empty_arguments":
+        altered = replace(plan, command=("",) * 6)
+    elif change == "list_command":
+        altered = replace(plan, command=arguments)
+    elif change == "short_command":
+        altered = replace(plan, command=plan.command[:-1])
+    elif change == "extra_argument":
+        altered = replace(plan, command=(*plan.command, "--execute"))
+    elif change in (
+        "non_string_argument",
+        "restore_command",
+        "source_argument",
+        "output_argument",
+        "output_flag",
+        "json_flag",
+        "relative_executable",
+    ):
+        position, value = {
+            "non_string_argument": (0, None),
+            "restore_command": (1, "restore"),
+            "source_argument": (2, str(plan.output)),
+            "output_argument": (4, str(plan.source)),
+            "output_flag": (3, "--other"),
+            "json_flag": (5, "--dry-run"),
+            "relative_executable": (0, "autoflow"),
+        }[change]
+        arguments[position] = value
+        altered = replace(plan, command=tuple(arguments))
+    elif change in ("foreign_names", "foreign_units"):
+        service = core.SystemdUnit("unrelated.service", plan.service.content)
+        timer = core.SystemdUnit("unrelated.timer", plan.timer.content)
+        if change == "foreign_units":
+            service = replace(service, content="[Service]\nExecStart=/other-program\n")
+            timer = replace(timer, content="[Timer]\nUnit=unrelated.service\nOnCalendar=daily\n")
+        altered = replace(plan, service=service, timer=timer)
+    elif change in ("service_content", "service_type", "service_override", "service_content_type"):
+        content = {
+            "service_content": "[Service]\nExecStart=/other-program\n",
+            "service_type": plan.service.content.replace("Type=oneshot", "Type=simple"),
+            "service_override": plan.service.content + "ExecStartPost=/other-program\n",
+            "service_content_type": None,
+        }[change]
+        altered = replace(plan, service=replace(plan.service, content=content))
+    elif change in ("timer_content", "timer_target", "timer_override", "timer_content_type"):
+        content = {
+            "timer_content": "[Timer]\nOnCalendar=weekly\n",
+            "timer_target": plan.timer.content.replace(plan.service.name, "unrelated.service"),
+            "timer_override": plan.timer.content + "[Timer]\nOnCalendar=hourly\n",
+            "timer_content_type": b"[Timer]\n",
+        }[change]
+        altered = replace(plan, timer=replace(plan.timer, content=content))
+    else:
+        altered = {
+            "scope": replace(plan, scope="system"),
+            "frequency": replace(plan, frequency="hourly"),
+            "frequency_mismatch": replace(plan, frequency="weekly"),
+            "source_field": replace(plan, source=str(plan.source)),
+            "output_field": replace(plan, output=str(plan.output)),
+            "service_name_type": replace(plan, service=replace(plan.service, name=None)),
+            "timer_name_type": replace(plan, timer=replace(plan.timer, name=1)),
+        }[change]
+    installed_check = Mock(side_effect=AssertionError("invalid plan reached filesystem check"))
+    monkeypatch.setattr(core, "_installed_unit_state", installed_check)
+    with pytest.raises(core.SchedulerError):
+        core._validate_backup_schedule_plan(altered)
+    result = core.activate_backup_schedule(altered)
+    assert not result.success and result.errors
+    assert not result.partial_activation_possible
+    installed_check.assert_not_called()
+    process.assert_not_called()
+
+
+def test_matching_foreign_files_do_not_legitimize_foreign_plan(plan, process):
+    foreign = replace(
+        plan,
+        command=(),
+        service=core.SystemdUnit("unrelated.service", "[Service]\nExecStart=/other-program\n"),
+        timer=core.SystemdUnit("unrelated.timer", "[Timer]\nUnit=unrelated.service\n"),
+    )
+    directory = core.user_unit_directory()
+    for unit in (foreign.service, foreign.timer):
+        (directory / unit.name).write_text(unit.content)
+    result = core.activate_backup_schedule(foreign)
+    assert not result.success and result.errors
+    process.assert_not_called()
