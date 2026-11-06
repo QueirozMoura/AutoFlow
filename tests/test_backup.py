@@ -93,11 +93,62 @@ def test_missing_source(tmp_path: Path) -> None:
     assert not (tmp_path / "backups").exists()
 
 
+@pytest.mark.parametrize(
+    "name", ["bad\\name", "bad\nname", "bad\rname", "bad\tname", "bad\x1bname", "bad\x7fname"]
+)
+@pytest.mark.parametrize("kind", ["file", "directory", "nested_file", "nested_directory"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_unrestorable_names_fail_without_writes(
+    tmp_path: Path, name: str, kind: str, dry_run: bool, existing_output: bool
+) -> None:
+    source = tmp_path / "source"
+    if kind.startswith("nested_"):
+        source.mkdir()
+        entry = source / name
+    else:
+        source = entry = tmp_path / name
+    if kind.endswith("directory"):
+        entry.mkdir()
+        (entry / "keep.txt").write_bytes(b"original")
+    else:
+        entry.write_bytes(b"original")
+    output = tmp_path / "backups"
+    if existing_output:
+        output.mkdir()
+        (output / "existing.tar.gz").write_bytes(b"previous backup")
+    originals = {path: contents(path) for path in tmp_path.rglob("*") if path.is_file()}
+    paths = sorted(tmp_path.rglob("*"))
+
+    with pytest.raises(core.BackupError, match="incompatible with restore") as error:
+        core.create_backup(source, output, dry_run=dry_run)
+
+    assert repr(name)[1:-1] in str(error.value)
+    assert sorted(tmp_path.rglob("*")) == paths
+    assert {path: contents(path) for path in originals} == originals
+
+
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_output_inside_source_is_rejected(source: Path, dry_run: bool) -> None:
     with pytest.raises(core.BackupError, match="outside"):
         core.create_backup(source, source / "backups", dry_run=dry_run)
     assert not (source / "backups").exists()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_archive_path_depth_limit_checked_before_output(tmp_path: Path, dry_run: bool) -> None:
+    source = tmp_path / "source"
+    directory = source.joinpath(*(["a"] * 127))
+    directory.mkdir(parents=True)
+    original = directory / "file.txt"
+    original.write_bytes(b"original")
+    output = tmp_path / "backups"
+
+    with pytest.raises(core.BackupError, match="incompatible with restore"):
+        core.create_backup(source, output, dry_run=dry_run)
+
+    assert original.read_bytes() == b"original"
+    assert not output.exists()
 
 
 def test_output_equal_to_source(source: Path) -> None:

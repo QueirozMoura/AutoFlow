@@ -22,6 +22,7 @@ from autoflow.core.backup import (
     _absolute,
     _directory,
     _rename_noreplace,
+    _safe_archive_path,
     _signature,
     _validate_output,
 )
@@ -158,15 +159,7 @@ def _member_path(info: tarfile.TarInfo) -> str:
     if info.sparse is not None or any(key.startswith("GNU.sparse") for key in info.pax_headers):
         raise RestoreError("Sparse archive entries are not supported")
     name = info.name.removesuffix("/") if info.isdir() else info.name
-    parts = name.split("/")
-    if (
-        not name
-        or len(name.encode("utf-8", errors="surrogateescape")) > 4096
-        or len(parts) > 128
-        or any(part in ("", ".", "..") for part in parts)
-        or "\\" in name
-        or any(ord(character) < 32 or ord(character) == 127 for character in name)
-    ):
+    if not _safe_archive_path(name):
         raise RestoreError("Unsafe archive path")
     if info.size < 0 or (info.isdir() and info.size != 0):
         raise RestoreError("Invalid archive entry size")

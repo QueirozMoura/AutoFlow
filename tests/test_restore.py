@@ -73,13 +73,70 @@ def test_dry_run_without_writes(backup: Path, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["../outside", "/absolute", "a/../../outside", "a/../b", "./name", "a//b", "a\\b", "bad\nname"],
+    [
+        "../outside",
+        "/absolute",
+        "a/../../outside",
+        "a/../b",
+        "./name",
+        "a//b",
+        "a\\b",
+        "bad\nname",
+        "bad\rname",
+        "bad\tname",
+        "bad\x1bname",
+        "bad\x7fname",
+        "a/" * 128 + "file",
+        "a/" * 126 + "é" * 2000,
+    ],
 )
-def test_unsafe_paths(tmp_path: Path, name: str) -> None:
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_unsafe_paths(tmp_path: Path, name: str, dry_run: bool) -> None:
     archive = make_archive(tmp_path, [(name, b"payload")])
     with pytest.raises(core.RestoreError, match="Unsafe"):
-        core.restore_backup(archive, tmp_path / "restored")
+        core.restore_backup(archive, tmp_path / "restored", dry_run=dry_run)
     assert list(tmp_path.iterdir()) == [archive]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "with spaces.txt",
+        "ação-日本語.txt",
+        "[report].txt",
+        "quote'\".txt",
+        "-report.txt",
+        "a:b.txt",
+        ".hidden",
+    ],
+)
+@pytest.mark.parametrize("single_file", [False, True])
+def test_special_names_backup_restore_round_trip(
+    tmp_path: Path, name: str, single_file: bool
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    entry = source / name
+    if single_file:
+        entry.write_bytes(b"original")
+        source = entry
+    else:
+        entry.mkdir()
+        (entry / name).write_bytes(b"original")
+    originals = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    backup = Path(create_backup(source, tmp_path / "backups").archive)
+    archive_bytes = backup.read_bytes()
+    output = tmp_path / "restored"
+
+    preview = core.restore_backup(backup, output, dry_run=True)
+    assert preview.success and not output.exists()
+    result = core.restore_backup(backup, output)
+
+    assert result.success and result.file_count == 1
+    restored = output / name if single_file else output / "source" / name / name
+    assert restored.read_bytes() == b"original"
+    assert backup.read_bytes() == archive_bytes
+    assert all(path.read_bytes() == value for path, value in originals.items())
 
 
 @pytest.mark.parametrize(
@@ -315,11 +372,12 @@ def test_oversized_metadata_rejected_before_allocation(tmp_path: Path) -> None:
     assert not list(tmp_path.glob(".autoflow-restore-*"))
 
 
-def test_pax_path_override_checked(tmp_path: Path) -> None:
+@pytest.mark.parametrize("name", ["../outside", "/absolute", "a//b", "a\\b", "bad\nname"])
+def test_pax_path_override_checked(tmp_path: Path, name: str) -> None:
     path = tmp_path / "pax.tar.gz"
     with tarfile.open(path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
         info = tarfile.TarInfo("safe")
-        info.pax_headers = {"path": "../outside"}
+        info.pax_headers = {"path": name}
         archive.addfile(info)
     with pytest.raises(core.RestoreError, match="Unsafe"):
         core.restore_backup(path, tmp_path / "restored")

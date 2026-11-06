@@ -129,6 +129,19 @@ def _mount_points() -> set[Path]:
     return points
 
 
+def _safe_archive_path(name: str) -> bool:
+    """Share backup/restore name rules; validate before any path normalization."""
+    parts = name.split("/")
+    return not (
+        not name
+        or len(name.encode("utf-8", errors="surrogateescape")) > 4096
+        or len(parts) > 128
+        or any(part in ("", ".", "..") for part in parts)
+        or "\\" in name
+        or any(ord(character) < 32 or ord(character) == 127 for character in name)
+    )
+
+
 def _discover(parent_fd: int, source: Path) -> tuple[list[_Entry], list[SkippedEntry]]:
     entries: list[_Entry] = []
     skipped: list[SkippedEntry] = []
@@ -153,6 +166,11 @@ def _discover(parent_fd: int, source: Path) -> tuple[list[_Entry], list[SkippedE
         if not (is_directory or stat.S_ISREG(metadata.st_mode)):
             skipped.append(SkippedEntry(relative.as_posix(), "special file (not read)"))
             return
+        if not _safe_archive_path(relative.as_posix()):
+            raise BackupError(
+                f"Source entry {relative.as_posix()!r} is incompatible with restore: "
+                "unsafe archive path (backslashes, control characters, or path limits)"
+            )
         flags = _DIRECTORY_FLAGS if is_directory else _FILE_FLAGS
         descriptor = os.open(name, flags, dir_fd=directory_fd)
         try:
