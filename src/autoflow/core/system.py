@@ -36,7 +36,13 @@ class SystemStatus:
 
 def _operating_system() -> OperatingSystem:
     release = platform.freedesktop_os_release()
-    return OperatingSystem(name=release["NAME"], version=release["VERSION_ID"])
+    if pretty_name := release.get("PRETTY_NAME"):
+        # PRETTY_NAME is a complete display name; do not append a version twice.
+        return OperatingSystem(name=pretty_name, version="")
+    return OperatingSystem(
+        name=release.get("NAME") or "Unknown operating system",
+        version=release.get("VERSION_ID") or release.get("VERSION") or "",
+    )
 
 
 def _uptime() -> float:

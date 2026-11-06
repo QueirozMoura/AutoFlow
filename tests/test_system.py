@@ -1,5 +1,6 @@
 """Deterministic collection and threshold tests without host metric reads."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -86,13 +87,49 @@ def test_psutil_error(metric_reads: dict[str, Mock]) -> None:
     assert "cpu_percent" in snapshot.errors
 
 
-def test_missing_os_version(metric_reads: dict[str, Mock]) -> None:
-    metric_reads["operating_system"].return_value = {"NAME": "Linux"}
+@pytest.mark.parametrize(
+    ("release", "expected"),
+    [
+        (
+            {"PRETTY_NAME": "Example Linux Rolling", "NAME": "Example Linux", "VERSION": "Rolling"},
+            system.OperatingSystem("Example Linux Rolling", ""),
+        ),
+        (
+            {"PRETTY_NAME": "Example Linux 1 (Stable)", "NAME": "Example Linux", "VERSION_ID": "1"},
+            system.OperatingSystem("Example Linux 1 (Stable)", ""),
+        ),
+        ({"PRETTY_NAME": "Example Linux"}, system.OperatingSystem("Example Linux", "")),
+        (
+            {"NAME": "Example Linux", "VERSION": "Rolling"},
+            system.OperatingSystem("Example Linux", "Rolling"),
+        ),
+        (
+            {"NAME": "Example Linux", "VERSION_ID": "1", "VERSION": "1 (Stable)"},
+            system.OperatingSystem("Example Linux", "1"),
+        ),
+        ({"NAME": "Linux"}, system.OperatingSystem("Linux", "")),
+        (
+            {"PRETTY_NAME": "", "NAME": "Example Linux", "VERSION_ID": "", "VERSION": "Rolling"},
+            system.OperatingSystem("Example Linux", "Rolling"),
+        ),
+        ({}, system.OperatingSystem("Unknown operating system", "")),
+        (
+            {"PRETTY_NAME": "", "NAME": "", "VERSION_ID": "", "VERSION": ""},
+            system.OperatingSystem("Unknown operating system", ""),
+        ),
+        ({"VERSION": "Rolling"}, system.OperatingSystem("Unknown operating system", "Rolling")),
+    ],
+)
+def test_os_identification_fallback_preserves_metrics(
+    metric_reads: dict[str, Mock], release: dict[str, str], expected: system.OperatingSystem
+) -> None:
+    baseline = system.collect_system_status()
+    metric_reads["operating_system"].return_value = release
 
     snapshot = system.collect_system_status()
 
-    assert snapshot.operating_system is None
-    assert "operating_system" in snapshot.errors
+    assert snapshot == replace(baseline, operating_system=expected)
+    assert snapshot.errors == {}
 
 
 def test_future_boot_time(metric_reads: dict[str, Mock]) -> None:

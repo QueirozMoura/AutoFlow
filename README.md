@@ -5,10 +5,12 @@ administration, developed primarily in Python. It aims to provide a modular,
 maintainable command-line interface with readable terminal output and explicit
 control over operations that affect the system.
 
-**Status: system status, backups, restoration, and log analysis.** Typer provides
+**Status: system status, backups, restoration, log analysis, and file organization.** Typer provides
 help, version, read-only `status`, `.tar.gz` backups, safe restoration into new
-directories, and bounded local file/systemd journal analysis. Commands support
-Rich output and plain JSON. Scheduling and Bash integrations are not implemented.
+directories, bounded local file/systemd journal analysis, and explicitly authorized
+file organization. Commands use Rich output; `status`, `backup`, `restore`, and
+`logs` also support plain JSON. `organize` has no `--json` option. Scheduling and
+Bash integrations are not implemented.
 
 ## Technology stack
 
@@ -38,8 +40,8 @@ versions will be verified as implementations and CI are added.
 │   └── autoflow/
 │       ├── __init__.py
 │       ├── cli.py        # Typer application and console entry point
-│       ├── commands/     # Status/backup/restore/logs terminal presentation
-│       ├── core/         # System metrics, backup/restore, and log analysis
+│       ├── commands/     # Status/backup/restore/logs/organize presentation
+│       ├── core/         # Metrics, backup/restore, logs, and file organization
 │       └── integrations/ # Bounded journalctl adapter; future Linux adapters
 ├── tests/                # CLI interface tests
 ├── .gitignore
@@ -365,6 +367,67 @@ reading can change the observed prefix. The journal deadline bounds subprocess
 I/O; local file I/O on a stalled filesystem has no deadline. Configured caps bound
 work and memory, but do not impose a general CPU quota. No scheduling is included.
 
+## File organization
+
+```bash
+autoflow organize /path/to/directory --dry-run
+autoflow organize /path/to/directory --execute
+autoflow organize /path/to/directory --execute --yes
+autoflow organize --help
+```
+
+Exactly one of `--dry-run` or `--execute` is required. `--dry-run` displays original
+and proposed relative paths plus counts by extension without creating directories
+or moving files. `--execute` displays the plan and requests confirmation, defaulting
+to no. Declining or pressing Enter cancels without changes; unavailable confirmation
+also cancels. `--execute --yes` skips only the prompt: planning and safety checks
+still apply. `--yes` requires `--execute`. If the plan changes after confirmation,
+execution is refused and the command must be run again to review the new plan.
+
+Only immediate regular files are organized; subdirectories are not traversed.
+The last filename suffix, lowercased and without its dot, names a directory inside
+the source. Original filenames are retained. Files without a suffix, including
+dotfiles without another suffix and trailing-dot names, use `no_extension`.
+
+| Original filename | Destination relative to the source |
+| --- | --- |
+| `report.txt` | `txt/report.txt` |
+| `photo.JPG` | `jpg/photo.JPG` |
+| `archive.tar.gz` | `gz/archive.tar.gz` |
+| `README` | `no_extension/README` |
+| `.env` | `no_extension/.env` |
+| `.config.json` | `json/.config.json` |
+
+Hidden regular files are included, so review the preview before organizing a
+directory containing application configuration. Symbolic links, including dangling
+links, and special files are left untouched; links are never followed. The source
+and its parent path components must not be symlinks. Execution reports skipped
+directories, links, and special files alongside moved files and errors.
+
+Existing real category directories may be reused. Any existing target, including
+a file, directory, or dangling link, invalidates the plan. A category path that
+is a file or symlink also invalidates the plan. There is no automatic renaming or
+overwrite option. Known plan issues prevent all moves. Execution rechecks the
+plan and every target before the first move, and uses atomic Linux
+`renameat2(RENAME_NOREPLACE)` for each move to prevent overwriting concurrent
+targets. Unsupported rename support fails without a copy/delete fallback.
+
+Execution requires source and category directories owned by the current user,
+without group/other write permission, with owner write/search permissions, and on
+the same filesystem. Missing category directories request mode `0700`, subject
+to umask. A valid dry-run does not guarantee that these execution checks will pass.
+
+The batch is **not atomic**. A later failure can leave a partially organized
+directory: completed moves and newly created directories remain, with **no
+automatic rollback or cleanup**. Review the moved, skipped, and error summaries
+before attempting recovery or rerunning the command. Avoid concurrent writers
+and changes to mounts or ancestors; metadata checks cannot eliminate every race.
+
+Successful previews, completed execution, and declined confirmation exit 0.
+Invalid plans, operational failures, and unavailable confirmation exit 1. Invalid
+CLI syntax exits 2. Output is human-readable Rich presentation; `organize` does
+not support `--json`.
+
 ## Quality checks
 
 The package uses the `src/` layout; install it in the development environment
@@ -386,6 +449,9 @@ cleanup failures, dry-run, and CLI integration using `tmp_path` only.
 Log tests use synthetic files/streams and mocked journalctl launches, covering
 classification, grouping, filters, privacy reduction, bounded reads, subprocess
 timeouts/cleanup, permission failures, JSON, and temporary-directory integration.
+Organizer tests use temporary directories to cover extension grouping, hidden
+files, symlink exclusions, collisions, confirmation and cancellation, safe moves,
+concurrent changes, and partial failures without rollback.
 CI workflows remain a future stage. Runtime dependencies and development tools are declared in
 `pyproject.toml`; reproducible dependency locking is deferred to the CI stage.
 
@@ -409,6 +475,7 @@ The ignore rules are a convenience, not a substitute for reviewing staged files.
 - [x] Create safe file and directory backups, previews, and structured JSON results.
 - [x] Restore validated backups atomically into new directories with bounded resource usage.
 - [x] Analyze local logs and accessible systemd journals with bounded reads and sanitized reports.
+- [x] Organize files by extension with previews, explicit execution, and no-overwrite moves.
 - [ ] Design scheduling in a separate stage.
 - [ ] Add carefully scoped automation and Bash integrations.
 - [ ] Document supported distributions, operational safeguards, and release procedures.

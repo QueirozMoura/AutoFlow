@@ -6,10 +6,13 @@ AutoFlow CLI targets Linux automation and system administration using Python
 3.12+. This document describes the intended architecture. At this stage, the
 repository contains packaging configuration, documentation, reserved module
 boundaries, and a Typer application with help, version, and read-only `status`.
-Rich provides terminal presentation; JSON supports machine consumers. `backup`
+Rich provides terminal presentation; `status`, `backup`, `restore`, and `logs`
+also support JSON for machine consumers. `organize` has no `--json` option. `backup`
 creates archives in an explicit destination. `restore` validates untrusted
 archives and publishes a new directory atomically. `logs` analyzes local files
-and accessible systemd journal records without modifying them. Scheduling is outside scope.
+and accessible systemd journal records without modifying them. `organize` previews
+and explicitly executes file moves into extension directories without overwriting
+existing targets. Scheduling is outside scope.
 
 ## Module responsibilities
 
@@ -27,6 +30,8 @@ and accessible systemd journal records without modifying them. Scheduling is out
 | `src/autoflow/commands/logs.py` | Select log source, configure limits, and render Rich/JSON summaries |
 | `src/autoflow/core/logs.py` | Read regular files, interpret levels, sanitize templates, and aggregate bounded streams |
 | `src/autoflow/integrations/journal.py` | Validate journal queries and manage bounded journalctl subprocess I/O |
+| `src/autoflow/commands/organize.py` | Render organization plans/results and enforce execution mode and confirmation |
+| `src/autoflow/core/organizer.py` | Plan extension groups, validate paths/collisions, and execute no-overwrite moves |
 | `src/autoflow/core/` | Own application rules, use cases, and adapter contracts |
 | `src/autoflow/integrations/` | Implement Linux, psutil, and external-process adapters |
 | `tests/` | Verify behavior with unit tests and controlled integration tests |
@@ -277,6 +282,65 @@ severity and normalization remain heuristics. Read/group caps bound memory/work
 but provide no CPU quota or local-filesystem I/O deadline. Journal visibility
 depends on the invoking user's existing permissions.
 
+### File organization execution and trust boundaries
+
+`cli.py` registers `organize` centrally. `commands/organize.py` renders Rich
+previews and results, validates mode selection, and handles confirmation. The
+core exposes `plan_organization` and `execute_organization`, returning frozen
+`OrganizationPlan`, `PlannedMove`, `PlanIssue`, and `OrganizationResult`
+dataclasses without Typer or Rich dependencies. The organizer reuses no-follow
+directory traversal and ownership checks from `core/backup.py` and runs no shell
+or external process.
+
+The command accepts these forms:
+
+```bash
+autoflow organize /path/to/directory --dry-run
+autoflow organize /path/to/directory --execute
+autoflow organize /path/to/directory --execute --yes
+```
+
+1. Require exactly one of `--dry-run` or `--execute`; `--yes` requires `--execute`.
+   Planning inspects immediate regular children only, including hidden files.
+   It does not recurse, read file contents, or modify the filesystem. The last
+   suffix, lowercased without the dot, defines a category inside the source;
+   suffixless files, dotfiles such as `.env`, and trailing-dot names use
+   `no_extension`. Thus `photo.JPG` maps to `jpg/photo.JPG`, `archive.tar.gz`
+   to `gz/archive.tar.gz`, and `.config.json` to `json/.config.json`.
+2. Reject source paths containing `..`, symlink source/ancestor components,
+   unsafe control/format characters, and paths exceeding filesystem limits.
+   Discovered subdirectories, symbolic links (including dangling links), and
+   special files are not moved or followed. Existing category directories are
+   allowed, but file/symlink categories and any existing target invalidate the
+   complete plan. There is no overwrite or automatic conflict renaming.
+3. Render proposed paths and extension counts. Invalid plans exit 1 without
+   execution; valid dry-runs return without creating directories or moving files.
+   Execution warns that partial work has no rollback, then requests confirmation
+   with a default of no. Declining cancels with exit 0; unavailable confirmation
+   cancels with exit 1. `--yes` bypasses the prompt only. Recheck the displayed
+   plan before invoking the core; changed plans require another review.
+4. The executor re-plans, pins source/category directory descriptors, checks
+   source file metadata, and preflights every target before the first move.
+   Require user-owned directories without group/other write permission, owner
+   write/search permissions, and a shared device. Create missing categories with
+   mode `0700`, subject to umask. Recheck directory attachment and file state
+   around each move, using Linux `renameat2(RENAME_NOREPLACE)` with directory
+   descriptors. A concurrent destination cannot be overwritten; unsupported
+   rename semantics fail without a copy/delete fallback.
+5. Return moved files, skipped entries, errors, and created directories. Expected
+   execution failures are recorded in the result; planning failures raise
+   `OrganizerError`. The CLI renders moved/skipped/error summaries and exits 1
+   on execution failure, including partial completion, or 0 on success. CLI
+   syntax errors exit 2. There is no JSON output option.
+
+Each move is atomic, but the batch is not. Completed moves and created category
+directories remain after a later failure; no automatic rollback, unlink, or
+directory cleanup is performed. Metadata checks do not close every
+check-to-rename window or isolate against hostile processes with the same
+credentials. Avoid concurrent writers and mount/ancestor changes; review the
+reported state before recovery. Planning does not guarantee execution permission
+or rename support.
+
 ### Future process integrations
 
 Prefer Python APIs for portable, testable operations. Introduce Bash only when
@@ -294,7 +358,7 @@ when an integration is introduced.
   destructive operations.
 - Separate read-only inspection from operations that change system state.
 
-Backup-specific protections are implemented as described above. Future
+Backup, restore, log analysis, and organizer protections are described above. Future
 system-changing commands must establish their own relevant safeguards.
 
 ## Testing and quality
@@ -318,6 +382,10 @@ replace journalctl launches with controlled synthetic child processes, exercisin
 real pipe draining, deadlines, early cancellation, error exits, and cleanup while
 never reading the host journal. CLI integration checks piped JSON and verifies the
 synthetic source content, mode, and modification time remain intact.
+Organizer tests use `tmp_path` for grouping and hidden-file behavior, path and
+collision rejection, symlink/special-file exclusions, confirmation and cancellation,
+metadata-preserving moves, no-overwrite races, unsupported rename support, and
+partial failures that retain completed moves and created directories.
 
 Ruff is configured in `pyproject.toml` for linting and formatting with a Python
 3.12 target. Future CI will run lint, format checks, and meaningful tests on Linux
@@ -326,8 +394,9 @@ with a documented Python version matrix. Empty directories are tracked with
 
 ## Staged evolution
 
-The CLI foundation, read-only status snapshot, safe backup creation/restoration and log analysis with
-temporary-fixture tests are in place. Next add CI checks and define further
+The CLI foundation, read-only status snapshot, safe backup creation/restoration,
+log analysis, and file organization with temporary-fixture tests are in place.
+Next add CI checks and define further
 command contracts; scheduling requires a separate design stage.
 Introduce automation only after adapter boundaries and operational
 safeguards have been tested. Dependency locking, release automation, configuration
