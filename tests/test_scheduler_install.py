@@ -12,6 +12,34 @@ import pytest
 from autoflow.core import scheduler as core
 
 
+def inject_close_failures(plan, monkeypatch, failures, before_close=None):
+    """Model Linux close errors after the descriptor has already been released."""
+    real_open, real_close = os.open, os.close
+    descriptors = {}
+    attempts = []
+
+    def track_open(name, flags, *args, **kwargs):
+        descriptor = real_open(name, flags, *args, **kwargs)
+        if flags & os.O_CREAT and name in (plan.service.name, plan.timer.name):
+            descriptors[descriptor] = name
+        return descriptor
+
+    def close(descriptor):
+        name = descriptors.get(descriptor)
+        if name is None:
+            return real_close(descriptor)
+        attempts.append(name)
+        if before_close is not None:
+            before_close(name)
+        real_close(descriptor)
+        if name in failures:
+            raise OSError(f"injected close failure: {name}")
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "close", close)
+    return attempts
+
+
 @pytest.fixture
 def installation(tmp_path: Path):
     source = tmp_path / "source"
@@ -345,3 +373,98 @@ def test_repeat_install_does_not_overwrite(installation):
     assert first.success and not second.success
     assert second.paths == ()
     assert {path: path.stat() for path in first.paths} == before
+
+
+@pytest.mark.parametrize("failed_units", [("service",), ("timer",), ("service", "timer")])
+@pytest.mark.parametrize("residues", [(), ("service",), ("timer",), ("service", "timer")])
+def test_close_failures_roll_back_and_report_residues(
+    installation, monkeypatch, failed_units, residues
+):
+    plan, directory = installation
+    unrelated = directory / "keep.service"
+    unrelated.write_bytes(b"preexisting data")
+    original = unrelated.stat()
+    failures = {getattr(plan, kind).name for kind in failed_units}
+    retained = {getattr(plan, kind).name for kind in residues}
+    real_unlink = os.unlink
+
+    def cleanup(name, *args, **kwargs):
+        if name in retained:
+            raise PermissionError(f"cleanup denied: {name}")
+        return real_unlink(name, *args, **kwargs)
+
+    attempts = inject_close_failures(plan, monkeypatch, failures)
+    monkeypatch.setattr(os, "unlink", cleanup)
+    result = core.install_backup_schedule(plan, directory)
+    assert not result.success
+    assert attempts == [plan.service.name, plan.timer.name]
+    for name in failures:
+        assert any(f"injected close failure: {name}" in error for error in result.errors)
+    assert set(result.paths) == {directory / name for name in retained}
+    assert set(directory.iterdir()) == {unrelated, *result.paths}
+    assert unrelated.read_bytes() == b"preexisting data"
+    assert unrelated.stat().st_ino == original.st_ino
+    assert unrelated.stat().st_mtime_ns == original.st_mtime_ns
+    for path in result.paths:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert any(f"cleanup denied: {path.name}" in error for error in result.errors)
+
+
+@pytest.mark.parametrize("unit_kind", ["service", "timer"])
+@pytest.mark.parametrize("replacement_kind", ["file", "symlink"])
+def test_close_failure_preserves_replaced_files(
+    installation, monkeypatch, unit_kind, replacement_kind
+):
+    plan, directory = installation
+    name = getattr(plan, unit_kind).name
+    path = directory / name
+    target = directory / "keep.txt"
+    target.write_bytes(b"untouched target")
+
+    def replace_before_close(closing_name):
+        if closing_name == name:
+            path.unlink()
+            if replacement_kind == "symlink":
+                path.symlink_to(target)
+            else:
+                path.write_bytes(b"replacement file")
+
+    attempts = inject_close_failures(plan, monkeypatch, {name}, before_close=replace_before_close)
+    result = core.install_backup_schedule(plan, directory)
+    assert not result.success and result.paths == ()
+    assert attempts == [plan.service.name, plan.timer.name]
+    assert any("preserved replaced unit" in error for error in result.errors)
+    assert set(directory.iterdir()) == {path, target}
+    assert target.read_bytes() == b"untouched target"
+    if replacement_kind == "symlink":
+        assert path.is_symlink() and path.readlink() == target
+    else:
+        assert path.read_bytes() == b"replacement file"
+
+
+def test_write_and_close_errors_are_both_reported(installation, monkeypatch):
+    plan, directory = installation
+    attempts = inject_close_failures(plan, monkeypatch, {plan.service.name})
+    monkeypatch.setattr(os, "write", Mock(side_effect=OSError("write failed")))
+    result = core.install_backup_schedule(plan, directory)
+    assert not result.success and result.paths == ()
+    assert "write failed" in result.errors[0]
+    assert any("injected close failure" in error for error in result.errors)
+    assert attempts == [plan.service.name]
+    assert list(directory.iterdir()) == []
+
+
+def test_close_failure_does_not_claim_disappeared_residue(installation, monkeypatch):
+    plan, directory = installation
+    attempts = inject_close_failures(plan, monkeypatch, {plan.service.name})
+    real_unlink = os.unlink
+
+    def removed_concurrently(name, *args, **kwargs):
+        real_unlink(name, *args, **kwargs)
+        raise FileNotFoundError("removed before cleanup")
+
+    monkeypatch.setattr(os, "unlink", removed_concurrently)
+    result = core.install_backup_schedule(plan, directory)
+    assert not result.success and result.paths == ()
+    assert attempts == [plan.service.name, plan.timer.name]
+    assert list(directory.iterdir()) == []

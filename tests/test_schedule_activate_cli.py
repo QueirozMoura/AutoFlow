@@ -307,3 +307,67 @@ def test_relative_xdg_path_is_rejected(installed, activation, monkeypatch):
     result = runner.invoke(app, arguments(plan))
     assert result.exit_code == 1
     activation.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
+@pytest.mark.parametrize("yes", [False, True])
+def test_cli_handles_activation_interrupt_without_traceback(installed, monkeypatch, stage, yes):
+    plan, directory = installed
+    calls = []
+    commands = [
+        ["systemctl", "--user", "daemon-reload"],
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "--no-pager",
+            "--all",
+            "--property=Id",
+            "--property=LoadState",
+            "--property=FragmentPath",
+            "--property=DropInPaths",
+            "--property=NeedDaemonReload",
+            plan.service.name,
+        ],
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "--no-pager",
+            "--all",
+            "--property=Id",
+            "--property=LoadState",
+            "--property=FragmentPath",
+            "--property=DropInPaths",
+            "--property=NeedDaemonReload",
+            plan.timer.name,
+        ],
+        ["systemctl", "--user", "enable", "--now", plan.timer.name],
+    ]
+
+    def respond(arguments, **kwargs):
+        calls.append(arguments)
+        if len(calls) - 1 == stage:
+            raise KeyboardInterrupt
+        assert len(calls) - 1 < stage, "command executed after interruption"
+        output = ""
+        if "show" in arguments:
+            name = arguments[-1]
+            output = (
+                f"Id={name}\nLoadState=loaded\nFragmentPath={directory / name}\n"
+                "DropInPaths=\nNeedDaemonReload=no\n"
+            )
+        return subprocess.CompletedProcess(arguments, 0, output, "")
+
+    monkeypatch.setattr(subprocess, "run", respond)
+    result = runner.invoke(app, arguments(plan, yes=yes), input="y\n")
+    assert result.exit_code == 1
+    assert "Timer activation failed" in result.stderr
+    assert "interrupted by user" in result.stderr
+    assert ("Warning: the timer may be partially enabled and/or active" in result.stderr) is (
+        stage == 3
+    )
+    assert "Traceback" not in result.output and "Aborted!" not in result.output
+    assert "Timer enabled and started" not in result.stdout
+    assert calls == commands[: stage + 1]
+    assert ("Enable and start this timer?" in result.stdout) is (not yes)

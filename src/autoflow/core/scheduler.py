@@ -214,9 +214,12 @@ def install_backup_schedule(
     components are opened without following symlinks. Plans are revalidated
     against current metadata and canonical planner output before writing.
 
-    On a handled failure, roll back only files whose inode still matches the
-    descriptor created here. Cleanup failures and remaining owned paths are
-    reported. Two-file publication is not atomic or crash recoverable: a process
+    On a handled failure, roll back only files whose metadata still matches the
+    descriptor created here. Capture identity before closing and attempt every
+    close once: Linux may release a descriptor even when close reports an error,
+    so retrying could close a reused descriptor. Close failures trigger rollback;
+    cleanup failures and remaining owned paths are reported. Two-file publication
+    is not atomic or crash recoverable: a process
     kill or power loss can leave incomplete units. Concurrent same-user writers
     and ancestor renames require external isolation; identity checks cannot
     eliminate every check-to-unlink race. No reload, enable, or start is run.
@@ -235,51 +238,71 @@ def install_backup_schedule(
             if os.fstat(directory_fd).st_mode & 0o300 != 0o300:
                 raise SchedulerError("Unit directory requires owner write and search permissions")
             created: list[tuple[str, int]] = []
+            identities: dict[str, tuple[int, ...]] = {}
             try:
-                # Preflight both names, including dangling links and special files.
-                for unit in (plan.service, plan.timer):
-                    try:
-                        os.stat(unit.name, dir_fd=directory_fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    raise SchedulerError(f"Unit already exists: {unit.name}")
-                for unit in (plan.service, plan.timer):
-                    descriptor = os.open(
-                        unit.name,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        0o600,
-                        dir_fd=directory_fd,
-                    )
-                    created.append((unit.name, descriptor))
-                    os.fchmod(descriptor, 0o600)
-                    content = memoryview(unit.content.encode("utf-8"))
-                    while content:
-                        written = os.write(descriptor, content)
-                        if written <= 0:
-                            raise OSError("Unit write made no progress")
-                        content = content[written:]
-                    os.fsync(descriptor)
-                with _directory(directory) as current_fd:
-                    current, original = os.fstat(current_fd), os.fstat(directory_fd)
-                    if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-                        raise SchedulerError("Unit directory changed during installation")
-                _validate_output(directory_fd)
-                for name, descriptor in created:
-                    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                    original = os.fstat(descriptor)
-                    if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-                        raise SchedulerError(f"Unit changed during installation: {name}")
-                os.fsync(directory_fd)
-            except BaseException:
-                for name, descriptor in reversed(created):
-                    try:
+                operation_failed = True
+                try:
+                    # Preflight both names, including dangling links and special files.
+                    for unit in (plan.service, plan.timer):
+                        try:
+                            os.stat(unit.name, dir_fd=directory_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        raise SchedulerError(f"Unit already exists: {unit.name}")
+                    for unit in (plan.service, plan.timer):
+                        descriptor = os.open(
+                            unit.name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            0o600,
+                            dir_fd=directory_fd,
+                        )
+                        created.append((unit.name, descriptor))
+                        os.fchmod(descriptor, 0o600)
+                        content = memoryview(unit.content.encode("utf-8"))
+                        while content:
+                            written = os.write(descriptor, content)
+                            if written <= 0:
+                                raise OSError("Unit write made no progress")
+                            content = content[written:]
+                        os.fsync(descriptor)
+                    with _directory(directory) as current_fd:
+                        current, original = os.fstat(current_fd), os.fstat(directory_fd)
+                        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                            raise SchedulerError("Unit directory changed during installation")
+                    _validate_output(directory_fd)
+                    for name, descriptor in created:
                         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                         original = os.fstat(descriptor)
                         if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                            raise SchedulerError(f"Unit changed during installation: {name}")
+                    os.fsync(directory_fd)
+                    operation_failed = False
+                finally:
+                    close_failed = False
+                    for name, descriptor in created:
+                        try:
+                            identities[name] = _signature(os.fstat(descriptor))
+                        except OSError as exc:
+                            close_failed = True
+                            errors.append(f"Cannot record unit identity {directory / name}: {exc}")
+                        try:
+                            os.close(descriptor)
+                        except OSError as exc:
+                            close_failed = True
+                            errors.append(f"Cannot close unit file {directory / name}: {exc}")
+                    if close_failed and not operation_failed:
+                        raise SchedulerError("Unit file closure failed")
+            except BaseException:
+                for name, _ in reversed(created):
+                    try:
+                        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if _signature(current) != identities.get(name):
                             errors.append(f"Cleanup preserved replaced unit: {directory / name}")
                             continue
                         try:
                             os.unlink(name, dir_fd=directory_fd)
+                        except FileNotFoundError:
+                            pass
                         except OSError:
                             remaining.append(directory / name)
                             raise
@@ -288,9 +311,6 @@ def install_backup_schedule(
                     except OSError as exc:
                         errors.append(f"Cannot clean up {directory / name}: {exc}")
                 raise
-            finally:
-                for _, descriptor in created:
-                    os.close(descriptor)
         return ScheduleInstallResult(
             success=True,
             paths=(directory / plan.service.name, directory / plan.timer.name),
@@ -312,6 +332,19 @@ class ScheduleActivationResult:
     timer: str | None
     errors: tuple[str, ...]
     partial_activation_possible: bool = False
+
+
+def _activation_failure(
+    timer: str | None, message: str, *, partial: bool = False
+) -> ScheduleActivationResult:
+    state = (
+        "The timer may be partially enabled and/or active; its state was not verified."
+        if partial
+        else (
+            "No timer enable/start was performed by this operation; preexisting state is unknown."
+        )
+    )
+    return ScheduleActivationResult(False, timer, (message, state), partial)
 
 
 def user_unit_directory() -> Path:
@@ -398,6 +431,8 @@ def activate_backup_schedule(
     Failure after enable/start begins can leave a timer enabled and/or active,
     including after a timeout kills the client. No disable, stop, removal, retry
     or rollback is attempted, and preexisting timer state is never inferred.
+    User interrupts return a failed result and end the sequence immediately;
+    interrupts during enable/start report that activation may be partial.
     """
     timer = (
         plan.timer.name
@@ -406,6 +441,11 @@ def activate_backup_schedule(
     )
     try:
         _validate_backup_schedule_plan(plan)
+    except KeyboardInterrupt:
+        return _activation_failure(
+            timer if isinstance(timer, str) else None,
+            "Activation interrupted by user during plan validation",
+        )
     except SchedulerError as exc:
         return ScheduleActivationResult(
             False,
@@ -420,6 +460,10 @@ def activate_backup_schedule(
             else _path(unit_directory, "unit directory")
         )
         original = _installed_unit_state(plan, directory)
+    except KeyboardInterrupt:
+        return _activation_failure(
+            timer, "Activation interrupted by user during installed-unit validation"
+        )
     except (SchedulerError, BackupError, OSError, ValueError, RuntimeError) as exc:
         return ScheduleActivationResult(False, timer, (f"Cannot validate installed units: {exc}",))
 
@@ -469,6 +513,13 @@ def activate_backup_schedule(
                 if result.stderr:
                     raise SchedulerError(f"Systemd query reported diagnostics: {unit.name}")
                 _verify_loaded_unit(result.stdout, unit, directory)
+        except KeyboardInterrupt:
+            interrupted_stage = (
+                "pre-activation validation" if stage == "enable --now" and not partial else stage
+            )
+            return _activation_failure(
+                timer, f"Activation interrupted by user during {interrupted_stage}", partial=partial
+            )
         except (SchedulerError, BackupError, ValueError, RuntimeError) as exc:
             partial = False
             message = f"Activation verification failed: {exc}"
@@ -486,13 +537,5 @@ def activate_backup_schedule(
             message = f"systemctl --user {stage} failed: {exc}"
         else:
             continue
-        state = (
-            "The timer may be partially enabled and/or active; its state was not verified."
-            if partial
-            else (
-                "No timer enable/start was performed by this operation; "
-                "preexisting state is unknown."
-            )
-        )
-        return ScheduleActivationResult(False, timer, (message, state), partial)
+        return _activation_failure(timer, message, partial=partial)
     return ScheduleActivationResult(True, timer, ())

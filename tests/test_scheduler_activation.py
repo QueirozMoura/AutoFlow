@@ -142,6 +142,55 @@ def test_timeout_reports_uncertain_activation_state(plan, process, stage):
 
 
 @pytest.mark.parametrize("stage", [0, 1, 2, 3])
+def test_keyboard_interrupt_stops_sequence_and_reports_state(plan, process, stage):
+    responses = successful_results(plan)
+    process.side_effect = responses[:stage] + [KeyboardInterrupt(), AssertionError("later command")]
+    result = core.activate_backup_schedule(plan)
+    assert not result.success and result.timer == plan.timer.name
+    assert "interrupted by user" in result.errors[0]
+    assert expected_calls(plan.timer.name)[stage].args[0][2] in result.errors[0]
+    assert result.partial_activation_possible is (stage == 3)
+    assert (
+        "partially enabled and/or active" if stage == 3 else "No timer enable/start"
+    ) in result.errors[1]
+    assert process.call_args_list == expected_calls(plan.timer.name)[: stage + 1]
+    for unit in (plan.service, plan.timer):
+        assert (core.user_unit_directory() / unit.name).read_text() == unit.content
+
+
+@pytest.mark.parametrize(
+    "phase", ["plan", "initial_installed", "before_enable", "loaded_properties"]
+)
+def test_interrupt_during_validation_never_reports_activation_attempt(
+    plan, process, monkeypatch, phase
+):
+    expected_count = 0
+    if phase == "plan":
+        monkeypatch.setattr(
+            core, "_validate_backup_schedule_plan", Mock(side_effect=KeyboardInterrupt())
+        )
+    elif phase == "initial_installed":
+        monkeypatch.setattr(core, "_installed_unit_state", Mock(side_effect=KeyboardInterrupt()))
+    elif phase == "before_enable":
+        original = core._installed_unit_state(plan, core.user_unit_directory())
+        monkeypatch.setattr(
+            core, "_installed_unit_state", Mock(side_effect=[original, KeyboardInterrupt()])
+        )
+        expected_count = 3
+    else:
+        monkeypatch.setattr(core, "_verify_loaded_unit", Mock(side_effect=KeyboardInterrupt()))
+        expected_count = 2
+    result = core.activate_backup_schedule(plan)
+    assert not result.success and not result.partial_activation_possible
+    assert "interrupted by user" in result.errors[0]
+    assert "No timer enable/start" in result.errors[1]
+    assert "preexisting state is unknown" in result.errors[1]
+    assert process.call_args_list == expected_calls(plan.timer.name)[:expected_count]
+    if phase == "before_enable":
+        assert "pre-activation validation" in result.errors[0]
+
+
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
 @pytest.mark.parametrize(
     "error", [FileNotFoundError("systemctl missing"), PermissionError("execution denied")]
 )
