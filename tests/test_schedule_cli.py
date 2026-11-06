@@ -1,4 +1,4 @@
-"""Exercise schedule previews and reject execution without touching user data."""
+"""Exercise schedule previews and confirmed installs using only temporary data."""
 
 import os
 import subprocess
@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from autoflow.cli import app
@@ -13,6 +14,15 @@ from autoflow.commands import schedule as command
 from autoflow.core import scheduler as core
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(subprocess, "Popen", Mock(side_effect=AssertionError("process attempted")))
+    monkeypatch.setattr(os, "system", Mock(side_effect=AssertionError("shell attempted")))
 
 
 @pytest.fixture
@@ -25,6 +35,13 @@ def paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     executable.chmod(0o700)
     monkeypatch.setattr(core.sys, "executable", str(tmp_path / "python"))
     return source, tmp_path / "missing" / "backup [blue] data"
+
+
+@pytest.fixture
+def unit_directory(paths, tmp_path: Path) -> Path:
+    directory = tmp_path / "home" / ".config" / "systemd" / "user"
+    directory.mkdir(parents=True, mode=0o700)
+    return directory
 
 
 def arguments(source: Path, output: Path, frequency: str = "daily") -> list[str]:
@@ -115,6 +132,133 @@ def test_execution_options_are_rejected(paths, option: str, monkeypatch) -> None
     result = runner.invoke(app, [*arguments(*paths), option])
     assert result.exit_code == 2
     planner.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [[], ["--yes"], ["--dry-run", "--yes"], ["--dry-run", "--install", "--yes"]],
+)
+def test_invalid_option_combinations(paths, options, monkeypatch) -> None:
+    planner = Mock()
+    installer = Mock()
+    monkeypatch.setattr(command, "plan_backup_schedule", planner)
+    monkeypatch.setattr(command, "install_backup_schedule", installer)
+    result = runner.invoke(app, arguments(*paths)[:-1] + options)
+    assert result.exit_code == 2
+    planner.assert_not_called()
+    installer.assert_not_called()
+
+
+@pytest.mark.parametrize("yes", [False, True])
+def test_install_uses_core_and_shows_complete_plan(paths, unit_directory, monkeypatch, yes) -> None:
+    plan = core.plan_backup_schedule(*paths, "daily")
+    installer = Mock(wraps=core.install_backup_schedule)
+    monkeypatch.setattr(command, "install_backup_schedule", installer)
+    args = arguments(*paths)[:-1] + ["--install"] + (["--yes"] if yes else [])
+    result = runner.invoke(app, args, input="y\n", env={"COLUMNS": "240"})
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    installer.assert_called_once_with(plan, unit_directory)
+    for unit in (plan.service, plan.timer):
+        path = unit_directory / unit.name
+        assert path.read_text() == unit.content
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert str(path) in result.stdout
+        for line in unit.content.splitlines():
+            if line:
+                # ExecStart can wrap even in a wide terminal.
+                assert "".join(line.split()) in "".join(result.stdout.replace("│", "").split())
+    assert "Scope" in result.stdout and "Command" in result.stdout
+    assert "The timer is not active" in result.stdout
+    assert "Schedule files installed" in result.stdout
+    if yes:
+        assert "Install these schedule files?" not in result.stdout
+    else:
+        prompt = result.stdout.index("Install these schedule files?")
+        assert result.stdout.index("[Service]") < prompt
+        assert result.stdout.index("[Timer]") < prompt
+        assert result.stdout.index(str(unit_directory)) < prompt
+    assert not paths[1].exists()
+    assert (paths[0] / "keep.txt").read_bytes() == b"original data"
+
+
+@pytest.mark.parametrize("answer", ["n\n", "\n"])
+def test_cancel_installation(paths, unit_directory, monkeypatch, answer) -> None:
+    installer = Mock()
+    monkeypatch.setattr(command, "install_backup_schedule", installer)
+    result = runner.invoke(app, arguments(*paths)[:-1] + ["--install"], input=answer)
+    assert result.exit_code == 0
+    assert "Installation cancelled" in result.stdout
+    installer.assert_not_called()
+    assert list(unit_directory.iterdir()) == []
+
+
+def test_confirmation_eof_is_failure(paths, unit_directory, monkeypatch) -> None:
+    installer = Mock()
+    monkeypatch.setattr(command, "install_backup_schedule", installer)
+    result = runner.invoke(app, arguments(*paths)[:-1] + ["--install"], input="")
+    assert result.exit_code == 1
+    assert "Confirmation unavailable" in result.stderr
+    installer.assert_not_called()
+    assert list(unit_directory.iterdir()) == []
+
+
+def test_confirmation_keyboard_interrupt_is_failure(paths, unit_directory, monkeypatch) -> None:
+    installer = Mock()
+    monkeypatch.setattr(command, "install_backup_schedule", installer)
+    monkeypatch.setattr(command.typer, "confirm", Mock(side_effect=typer.Abort()))
+    result = runner.invoke(app, arguments(*paths)[:-1] + ["--install"])
+    assert result.exit_code == 1
+    installer.assert_not_called()
+    assert list(unit_directory.iterdir()) == []
+
+
+def test_install_requires_existing_directory(paths, tmp_path: Path) -> None:
+    result = runner.invoke(app, arguments(*paths)[:-1] + ["--install", "--yes"])
+    assert result.exit_code == 1
+    assert "Schedule installation failed" in result.stderr
+    assert not (tmp_path / "home" / ".config").exists()
+
+
+@pytest.mark.parametrize("unit_kind", ["service", "timer"])
+def test_install_collision_preserves_existing_file(paths, unit_directory, unit_kind) -> None:
+    plan = core.plan_backup_schedule(*paths, "daily")
+    path = unit_directory / getattr(plan, unit_kind).name
+    path.write_bytes(b"preexisting unit")
+    result = runner.invoke(app, arguments(*paths)[:-1] + ["--install", "--yes"])
+    assert result.exit_code == 1
+    assert "Unit already exists" in result.stderr
+    assert "Schedule files installed" not in result.stdout
+    assert list(unit_directory.iterdir()) == [path]
+    assert path.read_bytes() == b"preexisting unit"
+
+
+def test_install_reports_core_errors_and_residues(paths, unit_directory, monkeypatch) -> None:
+    residue = unit_directory / "remaining.service"
+    installer = Mock(
+        return_value=core.ScheduleInstallResult(
+            False, (residue,), ("Write failed [bold]", "Cleanup denied")
+        )
+    )
+    monkeypatch.setattr(command, "install_backup_schedule", installer)
+    result = runner.invoke(
+        app, arguments(*paths)[:-1] + ["--install", "--yes"], env={"COLUMNS": "240"}
+    )
+    assert result.exit_code == 1
+    assert "Write failed [bold]" in result.stderr
+    assert "Cleanup denied" in result.stderr
+    assert str(residue) in result.stderr
+    assert "File remaining" in result.stderr
+    assert "Schedule files installed" not in result.stdout
+
+
+def test_dry_run_never_calls_installer(paths, unit_directory, monkeypatch) -> None:
+    installer = Mock()
+    monkeypatch.setattr(command, "install_backup_schedule", installer)
+    result = runner.invoke(app, arguments(*paths))
+    assert result.exit_code == 0
+    installer.assert_not_called()
+    assert list(unit_directory.iterdir()) == []
 
 
 @pytest.mark.parametrize("kind", ["missing", "file", "inside", "same", "protected", "symlink"])

@@ -1,5 +1,6 @@
-"""Preview backup schedules using the read-only core planner."""
+"""Preview backup schedules and explicitly confirm core-managed installation."""
 
+import shlex
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -10,10 +11,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from autoflow.core.scheduler import SchedulerError, plan_backup_schedule
+from autoflow.core.scheduler import (
+    SchedulerError,
+    install_backup_schedule,
+    plan_backup_schedule,
+)
 
-schedule = typer.Typer(help="Preview schedules without installing systemd units.")
-add = typer.Typer(help="Plan a new schedule (dry-run only).")
+schedule = typer.Typer(help="Preview or install schedule files without activating timers.")
+add = typer.Typer(help="Plan a new schedule and optionally install its unit files.")
 schedule.add_typer(add, name="add")
 
 
@@ -31,15 +36,26 @@ def backup(
     ],
     every: Annotated[Frequency, typer.Option("--every", help="Backup frequency.")],
     dry_run: Annotated[
-        bool, typer.Option("--dry-run", help="Required: preview without making changes.")
+        bool, typer.Option("--dry-run", help="Preview without making changes.")
+    ] = False,
+    install: Annotated[
+        bool, typer.Option("--install", help="Preview and install unit files after confirmation.")
+    ] = False,
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Skip confirmation; requires --install.")
     ] = False,
 ) -> None:
-    """Preview a backup service and timer; --dry-run is required."""
-    if not dry_run:
-        raise typer.BadParameter("--dry-run is required at this stage", param_hint="--dry-run")
+    """Choose --dry-run or --install; installation does not activate the timer."""
+    if yes and not install:
+        raise typer.BadParameter("--yes requires --install", param_hint="--yes")
+    if dry_run == install:
+        raise typer.BadParameter(
+            "Select exactly one of --dry-run or --install", param_hint="--dry-run / --install"
+        )
     try:
         plan = plan_backup_schedule(source, output, every.value)
-    except SchedulerError as exc:
+        unit_directory = Path.home() / ".config" / "systemd" / "user" if install else None
+    except (SchedulerError, OSError, RuntimeError) as exc:
         Console(stderr=True).print(Text(str(exc), style="red"))
         raise typer.Exit(code=1) from exc
 
@@ -51,8 +67,43 @@ def backup(
     table.add_row("Frequency", Text(plan.frequency))
     table.add_row("Source", Text(str(plan.source)))
     table.add_row("Output", Text(str(plan.output)))
+    table.add_row("Scope", Text(plan.scope))
+    table.add_row("Command", Text(shlex.join(plan.command)))
+    if unit_directory is not None:
+        table.add_row("Unit directory", Text(str(unit_directory)))
     console = Console()
-    console.print(Panel(table, title="Backup schedule preview (dry-run)", border_style="cyan"))
+    mode = "dry-run" if dry_run else "install"
+    console.print(Panel(table, title=f"Backup schedule preview ({mode})", border_style="cyan"))
+    for unit in (plan.service, plan.timer):
+        console.print(Panel(Text(unit.content), title=Text(unit.name), border_style="cyan"))
+    if dry_run:
+        console.print(
+            "Preview only. No files changed; no systemd units created, installed or activated."
+        )
+        return
     console.print(
-        "Preview only. No files changed; no systemd units created, installed or activated."
+        "Installation writes unit files only. The directory must already exist. "
+        "The timer will not be activated."
     )
+    if not yes:
+        try:
+            confirmed = typer.confirm("Install these schedule files?", default=False)
+        except typer.Abort as exc:
+            Console(stderr=True).print("Confirmation unavailable; installation cancelled.")
+            raise typer.Exit(code=1) from exc
+        if not confirmed:
+            console.print("Installation cancelled. No files changed.")
+            return
+    result = install_backup_schedule(plan, unit_directory)
+    if not result.success:
+        errors = Console(stderr=True)
+        errors.print("Schedule installation failed.", style="red")
+        for error in result.errors:
+            errors.print(Text(error, style="red"))
+        for path in result.paths:
+            errors.print(Text(f"File remaining after failed cleanup: {path}", style="yellow"))
+        raise typer.Exit(code=1)
+    console.print("Schedule files installed:", style="green")
+    for path in result.paths:
+        console.print(Text(str(path)))
+    console.print("The timer is not active. No timers were enabled or started.")

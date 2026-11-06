@@ -1,10 +1,11 @@
-"""Read-only planning of backup services and timers for the systemd user manager.
+"""Backup schedule planning and explicit file installation for systemd users.
 
 Plans are data, not installed schedules: no unit files, processes, or directories
 are created. Metadata validation does not inventory source contents or guarantee
 future permissions, free space, executable availability, or systemd support.
 Calendar aliases use the manager's local timezone. User-manager lifetime and
-installation/activation belong to a future execution layer.
+activation belongs to a future execution layer. Installation only writes unit
+files to an explicitly supplied existing directory; it never activates timers.
 """
 
 import hashlib
@@ -148,3 +149,136 @@ def plan_backup_schedule(
         return BackupSchedulePlan(source, output, frequency, command, service, timer)
     except (OSError, ValueError, TypeError, RuntimeError, BackupError) as exc:
         raise SchedulerError(f"Cannot plan backup schedule: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class ScheduleInstallResult:
+    """Paths contains only installed files, or operation-owned rollback residues.
+
+    A failed operation can leave paths when cleanup fails; errors includes those
+    failures. Preexisting or concurrently replaced files are never claimed.
+    """
+
+    success: bool
+    paths: tuple[Path, ...]
+    errors: tuple[str, ...]
+
+
+def _validate_install_plan(plan: BackupSchedulePlan) -> None:
+    """Accept only a complete, canonical plan from the existing planner."""
+    if (
+        not isinstance(plan, BackupSchedulePlan)
+        or not isinstance(plan.service, SystemdUnit)
+        or not isinstance(plan.timer, SystemdUnit)
+        or not isinstance(plan.service.name, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,246}\.service", plan.service.name) is None
+        or not isinstance(plan.command, tuple)
+        or len(plan.command) != 6
+        or not all(isinstance(argument, str) for argument in plan.command)
+    ):
+        raise SchedulerError("Invalid backup schedule plan")
+    expected = plan_backup_schedule(
+        plan.source,
+        plan.output,
+        plan.frequency,
+        unit_name=plan.service.name.removesuffix(".service"),
+        executable=Path(plan.command[0]),
+    )
+    if plan != expected:
+        raise SchedulerError("Backup schedule plan differs from the validated planner output")
+
+
+def install_backup_schedule(
+    plan: BackupSchedulePlan, unit_directory: Path
+) -> ScheduleInstallResult:
+    """Install two unit files with mode 0600, without overwriting or activation.
+
+    The explicit destination must already exist, be owned by the current user,
+    allow owner write/search, and not be group/world-writable. All directory
+    components are opened without following symlinks. Plans are revalidated
+    against current metadata and canonical planner output before writing.
+
+    On a handled failure, roll back only files whose inode still matches the
+    descriptor created here. Cleanup failures and remaining owned paths are
+    reported. Two-file publication is not atomic or crash recoverable: a process
+    kill or power loss can leave incomplete units. Concurrent same-user writers
+    and ancestor renames require external isolation; identity checks cannot
+    eliminate every check-to-unlink race. No reload, enable, or start is run.
+    """
+    errors: list[str] = []
+    remaining: list[Path] = []
+    try:
+        _validate_install_plan(plan)
+        directory = _path(unit_directory, "unit directory")
+        if directory == Path("/") or any(
+            directory == protected or protected in directory.parents for protected in _PROTECTED
+        ):
+            raise SchedulerError(f"Protected unit directory: {directory}")
+        with _directory(directory) as directory_fd:
+            _validate_output(directory_fd)
+            if os.fstat(directory_fd).st_mode & 0o300 != 0o300:
+                raise SchedulerError("Unit directory requires owner write and search permissions")
+            created: list[tuple[str, int]] = []
+            try:
+                # Preflight both names, including dangling links and special files.
+                for unit in (plan.service, plan.timer):
+                    try:
+                        os.stat(unit.name, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    raise SchedulerError(f"Unit already exists: {unit.name}")
+                for unit in (plan.service, plan.timer):
+                    descriptor = os.open(
+                        unit.name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    created.append((unit.name, descriptor))
+                    os.fchmod(descriptor, 0o600)
+                    content = memoryview(unit.content.encode("utf-8"))
+                    while content:
+                        written = os.write(descriptor, content)
+                        if written <= 0:
+                            raise OSError("Unit write made no progress")
+                        content = content[written:]
+                    os.fsync(descriptor)
+                with _directory(directory) as current_fd:
+                    current, original = os.fstat(current_fd), os.fstat(directory_fd)
+                    if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                        raise SchedulerError("Unit directory changed during installation")
+                _validate_output(directory_fd)
+                for name, descriptor in created:
+                    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    original = os.fstat(descriptor)
+                    if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                        raise SchedulerError(f"Unit changed during installation: {name}")
+                os.fsync(directory_fd)
+            except BaseException:
+                for name, descriptor in reversed(created):
+                    try:
+                        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        original = os.fstat(descriptor)
+                        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                            errors.append(f"Cleanup preserved replaced unit: {directory / name}")
+                            continue
+                        try:
+                            os.unlink(name, dir_fd=directory_fd)
+                        except OSError:
+                            remaining.append(directory / name)
+                            raise
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        errors.append(f"Cannot clean up {directory / name}: {exc}")
+                raise
+            finally:
+                for _, descriptor in created:
+                    os.close(descriptor)
+        return ScheduleInstallResult(
+            success=True,
+            paths=(directory / plan.service.name, directory / plan.timer.name),
+            errors=(),
+        )
+    except (SchedulerError, BackupError, OSError, ValueError, TypeError, RuntimeError) as exc:
+        return ScheduleInstallResult(False, tuple(remaining), (str(exc), *errors))
