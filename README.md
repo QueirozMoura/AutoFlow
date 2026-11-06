@@ -5,9 +5,10 @@ administration, developed primarily in Python. It aims to provide a modular,
 maintainable command-line interface with readable terminal output and explicit
 control over operations that affect the system.
 
-**Status: read-only system status.** Typer provides help, version, and a `status`
-command with a Rich dashboard or plain JSON output. System-changing operations
-and Bash integrations are not implemented.
+**Status: system status and backup creation.** Typer provides help, version,
+read-only `status`, and safe `.tar.gz` backup creation. Both commands support
+Rich terminal output and plain JSON. Restoration, scheduling, and Bash
+integrations are not implemented.
 
 ## Technology stack
 
@@ -37,8 +38,8 @@ versions will be verified as implementations and CI are added.
 │   └── autoflow/
 │       ├── __init__.py
 │       ├── cli.py        # Typer application and console entry point
-│       ├── commands/     # Status command and terminal presentation
-│       ├── core/         # System snapshots and utilization thresholds
+│       ├── commands/     # Status/backup commands and terminal presentation
+│       ├── core/         # System metrics, thresholds, and backup operations
 │       └── integrations/ # Future Linux and process adapters
 ├── tests/                # CLI interface tests
 ├── .gitignore
@@ -103,6 +104,90 @@ available, the failed field becomes `null` in JSON or `Unavailable` in the
 dashboard, and `errors` maps field names to read errors. The command exits with
 code 1 while still emitting the snapshot. No elevated privileges are required.
 
+## Backups
+
+```bash
+autoflow backup ~/Documents --output ~/Backups
+autoflow backup ~/Documents --output ~/Backups --dry-run
+autoflow backup ~/Documents --output ~/Backups --json
+autoflow backup ~/Documents/report.txt --output ~/Backups
+autoflow backup ~/Documents --output ~/Backups --dry-run --json
+```
+
+The destination is a directory, created if necessary, and must be outside the
+source tree. Each archive has a UTC timestamp and random UUID, for example
+`autoflow-20261106T153000.123456Z-<uuid>.tar.gz`. Existing backups are never
+overwritten, including during concurrent runs. Directory archives contain a
+top-level directory named after the source, retaining relative paths and empty
+directories. A single-file backup contains that file's basename.
+
+The human interface displays entry-based Rich progress, file count, original
+logical size, compressed archive size, and elapsed seconds. `--dry-run` lists
+files, directories, exclusions, and total uncompressed file bytes without
+creating any files or directories. It checks discovery and file-open permissions
+but does not read every file's contents or predict the compressed size.
+
+`--json` emits exactly one JSON object without progress, ANSI codes, or other
+messages, including with redirected stdout. Successful results contain:
+
+| Field | Meaning |
+| --- | --- |
+| `success`, `dry_run` | Completion and preview flags |
+| `source`, `output`, `archive` | Absolute paths; archive is null for previews |
+| `file_count`, `original_bytes` | Regular file count and uncompressed logical size |
+| `compressed_bytes`, `duration_seconds` | Archive size (null for previews) and elapsed time |
+| `files`, `directories` | Relative archive entries |
+| `skipped` | Explicit safety exclusions, each with `path` and `reason` |
+
+Completion exits with code 0. An operational failure exits with code 1; JSON
+contains `success: false`, `dry_run`, and `error`. Invalid CLI syntax uses Typer's
+standard usage error and exit code 2. Policy exclusions are reported, not treated
+as read failures; inspect `skipped` when complete coverage matters.
+
+### Backup safety policy and limits
+
+- Symbolic links discovered inside the source are excluded, whether internal,
+  external, dangling, or cyclic. Links supplied as the source or in any source
+  or destination path component are rejected. No links are followed during
+  discovery or copying.
+- Nested mount points, including same-device bind mounts, and entries on a
+  different device are excluded. The source's own filesystem is allowed.
+  Linux `/proc/self/mountinfo` must be readable; otherwise the backup fails.
+- FIFOs, sockets, and device files are excluded without reading them. `/` and
+  sources within `/proc`, `/sys`, `/dev`, and `/run` are rejected. Destinations
+  within these special trees are rejected too.
+- Read errors, permission errors, disappearing entries, and detected changes
+  cancel the operation. Metadata is checked before/after copying and the source
+  is scanned again before publication. No partially completed archive is
+  reported as successful.
+- New destination directories request mode `0700`; temporary and final archives
+  request mode `0600` (a restrictive umask may reduce permissions further).
+  Existing directory permissions are preserved, but the destination must be
+  owned by the current user and must not be group/world-writable. This prevents
+  other users from replacing temporary files before publication or cleanup.
+- A uniquely and exclusively created `.tar.gz.part` file is closed and synced
+  before atomic publication using Linux `renameat2(RENAME_NOREPLACE)`. An
+  unsupported libc/kernel/filesystem causes an error; there is no overwriting
+  fallback. Only this invocation's temporary file is removed on failure or
+  ordinary cancellation. Existing backups are retained. Newly created empty
+  destination directories may remain after failure.
+- This is a file-level backup, not an atomic filesystem snapshot. Stop writers
+  for consistency: changes after the final validation, or changes concealed by
+  filesystem metadata behavior, cannot be ruled out. Do not rearrange mount
+  points or source/destination directories while backing up.
+- File contents are streamed, but the entry inventory is held in memory. Deep
+  trees are subject to Python recursion and OS file-descriptor limits. Progress
+  advances after each entry, so large files may take time between updates. Regular
+  hard links are stored as independent file contents. Basic modes, timestamps,
+  and numeric owners are recorded; setuid/setgid/sticky bits, ACLs, extended
+  attributes, sparse-file layout, and hard-link relationships are not retained.
+- Original content and permissions are never written. The filesystem may update
+  access timestamps as files and directories are read. Backups are not encrypted.
+  Forced termination or power loss can leave a `.part` file; full crash durability
+  is not guaranteed. Cleanup failures are reported explicitly.
+
+## Quality checks
+
 The package uses the `src/` layout; install it in the development environment
 before running package tests. Quality checks are:
 
@@ -113,7 +198,9 @@ python -m pytest
 ```
 
 Tests cover the base CLI, mocked metric reads and failures, utilization
-boundaries, dashboard rendering, and plain JSON output.
+boundaries, dashboard rendering, and plain JSON output. Backup tests use only
+temporary fixtures and cover archive content, source integrity, exclusions,
+concurrent publication, change detection, permission errors, and failure cleanup.
 CI workflows remain a future stage. Runtime dependencies and development tools are declared in
 `pyproject.toml`; reproducible dependency locking is deferred to the CI stage.
 
@@ -134,6 +221,8 @@ The ignore rules are a convenience, not a substitute for reviewing staged files.
 - [x] Add basic CLI interface tests.
 - [ ] Define initial system command contracts and add GitHub Actions quality checks.
 - [x] Introduce read-only system inspection and metrics with `status` and JSON output.
+- [x] Create safe file and directory backups, previews, and structured JSON results.
+- [ ] Design restoration and scheduling in separate stages.
 - [ ] Add carefully scoped automation and Bash integrations.
 - [ ] Document supported distributions, operational safeguards, and release procedures.
 

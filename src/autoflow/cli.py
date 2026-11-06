@@ -6,6 +6,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from autoflow.commands.backup import backup
 from autoflow.commands.status import status
 
 app = typer.Typer(
@@ -16,6 +17,7 @@ app = typer.Typer(
 )
 
 app.command()(status)
+app.command()(backup)
 
 
 def _show_version(value: bool) -> None:
