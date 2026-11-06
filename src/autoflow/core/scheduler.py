@@ -1,17 +1,18 @@
-"""Backup schedule planning and explicit file installation for systemd users.
+"""Backup schedule planning, file installation and explicit user-timer activation.
 
 Plans are data, not installed schedules: no unit files, processes, or directories
 are created. Metadata validation does not inventory source contents or guarantee
 future permissions, free space, executable availability, or systemd support.
-Calendar aliases use the manager's local timezone. User-manager lifetime and
-activation belongs to a future execution layer. Installation only writes unit
+Calendar aliases use the manager's local timezone. Installation only writes unit
 files to an explicitly supplied existing directory; it never activates timers.
+Only an explicit activation call invokes systemctl, against the user manager.
 """
 
 import hashlib
 import os
 import re
 import stat
+import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -282,3 +283,89 @@ def install_backup_schedule(
         )
     except (SchedulerError, BackupError, OSError, ValueError, TypeError, RuntimeError) as exc:
         return ScheduleInstallResult(False, tuple(remaining), (str(exc), *errors))
+
+
+@dataclass(frozen=True)
+class ScheduleActivationResult:
+    """Report command success, not independently verified systemd state.
+
+    partial_activation_possible means a failed enable/start command may have
+    changed state. False does not imply that a previously existing timer is off.
+    """
+
+    success: bool
+    timer: str | None
+    errors: tuple[str, ...]
+    partial_activation_possible: bool = False
+
+
+def activate_backup_schedule(plan: BackupSchedulePlan) -> ScheduleActivationResult:
+    """Reload the user manager and enable/start exactly the plan's timer.
+
+    Validate a literal timer basename and its matching user service before any
+    subprocess. Each command has a 30-second timeout, no shell and no stdin.
+    Installation must already have been performed separately. This function
+    cannot verify installed unit contents or which search path systemd resolves;
+    the caller must ensure the intended units are installed in its user manager.
+    Failure after enable/start begins can leave a timer enabled and/or active,
+    including after a timeout kills the client. No disable, stop, removal, retry
+    or rollback is attempted, and preexisting timer state is never inferred.
+    """
+    timer = (
+        plan.timer.name
+        if isinstance(plan, BackupSchedulePlan) and isinstance(plan.timer, SystemdUnit)
+        else None
+    )
+    if (
+        not isinstance(timer, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,246}\.timer", timer) is None
+        or plan.scope != "user"
+        or not isinstance(plan.service, SystemdUnit)
+        or plan.service.name != timer.removesuffix(".timer") + ".service"
+    ):
+        return ScheduleActivationResult(
+            False,
+            timer if isinstance(timer, str) else None,
+            ("Invalid user backup timer name or mismatched service in schedule plan",),
+        )
+
+    for stage, arguments in (
+        ("daemon-reload", ["systemctl", "--user", "daemon-reload"]),
+        ("enable --now", ["systemctl", "--user", "enable", "--now", timer]),
+    ):
+        partial = stage == "enable --now"
+        try:
+            subprocess.run(
+                arguments,
+                shell=False,
+                check=True,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except (FileNotFoundError, PermissionError) as exc:
+            partial = False
+            message = f"systemctl --user {stage} could not start: {exc}"
+        except subprocess.TimeoutExpired:
+            message = f"systemctl --user {stage} timed out after 30 seconds"
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr or exc.stdout or "No diagnostic output"
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", errors="replace")
+            message = f"systemctl --user {stage} failed (exit {exc.returncode}): {detail.strip()}"
+        except (OSError, subprocess.SubprocessError) as exc:
+            message = f"systemctl --user {stage} failed: {exc}"
+        else:
+            continue
+        state = (
+            "The timer may be partially enabled and/or active; its state was not verified."
+            if partial
+            else (
+                "No timer enable/start was performed by this operation; "
+                "preexisting state is unknown."
+            )
+        )
+        return ScheduleActivationResult(False, timer, (message, state), partial)
+    return ScheduleActivationResult(True, timer, ())
