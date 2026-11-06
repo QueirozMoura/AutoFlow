@@ -13,6 +13,7 @@ from rich.text import Text
 
 from autoflow.core.health import classify_usage
 from autoflow.core.system import SystemStatus, collect_system_status
+from autoflow.presentation import safe_text
 
 _COLORS = {"normal": "green", "warning": "yellow", "critical": "red"}
 
@@ -39,8 +40,8 @@ def render_status(snapshot: SystemStatus, console: Console) -> None:
     """Render a snapshot without collecting data or changing its values."""
     info = Table.grid(padding=(0, 2))
     os_info = snapshot.operating_system
-    info.add_row("OS", Text(f"{os_info.name} {os_info.version}" if os_info else "Unavailable"))
-    info.add_row("Hostname", Text(snapshot.hostname or "Unavailable"))
+    info.add_row("OS", safe_text(f"{os_info.name} {os_info.version}" if os_info else "Unavailable"))
+    info.add_row("Hostname", safe_text(snapshot.hostname or "Unavailable"))
     info.add_row("Uptime", _uptime(snapshot.uptime_seconds))
 
     metrics = Table(expand=True)
@@ -71,7 +72,7 @@ def render_status(snapshot: SystemStatus, console: Console) -> None:
         Panel(Group(info, Text(), metrics), title="AutoFlow • System status", border_style="cyan")
     )
     for name, error in snapshot.errors.items():
-        console.print(Text(f"Unavailable: {name}: {error}", style="yellow"))
+        console.print(safe_text(f"Unavailable: {name}: {error}", style="yellow"))
 
 
 def status(

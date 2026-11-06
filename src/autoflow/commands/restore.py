@@ -11,7 +11,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
-from rich.text import Text
 
 from autoflow.core.restore import (
     DEFAULT_MAX_BYTES,
@@ -19,6 +18,7 @@ from autoflow.core.restore import (
     RestoreError,
     restore_backup,
 )
+from autoflow.presentation import safe_text
 
 
 def restore(
@@ -65,7 +65,7 @@ def restore(
         if json_output:
             typer.echo(json.dumps({"success": False, "dry_run": dry_run, "error": str(exc)}))
         else:
-            Console(stderr=True).print(Text(str(exc), style="red"))
+            Console(stderr=True).print(safe_text(str(exc), style="red"))
         raise typer.Exit(1) from exc
     if json_output:
         typer.echo(json.dumps(asdict(result), allow_nan=False))
@@ -73,8 +73,8 @@ def restore(
     table = Table.grid(padding=(0, 2))
     table.add_column(no_wrap=True)
     table.add_column(overflow="fold")
-    table.add_row("Archive", Text(result.archive))
-    table.add_row("Output", Text(result.output))
+    table.add_row("Archive", safe_text(result.archive))
+    table.add_row("Output", safe_text(result.output))
     table.add_row("Files", str(result.file_count))
     table.add_row("Uncompressed size", f"{result.total_bytes:,} bytes")
     table.add_row("Duration", f"{result.duration_seconds:.3f} s")
@@ -83,6 +83,6 @@ def restore(
     console.print(Panel(table, title=title, border_style="green"))
     if dry_run:
         for name in result.directories:
-            console.print(Text(f"  {name}/"))
+            console.print(safe_text(f"  {name}/"))
         for name in result.files:
-            console.print(Text(f"  {name}"))
+            console.print(safe_text(f"  {name}"))

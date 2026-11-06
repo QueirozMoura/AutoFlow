@@ -11,21 +11,21 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
-from rich.text import Text
 
 from autoflow.core.backup import BackupError, BackupResult, create_backup
+from autoflow.presentation import safe_text
 
 
 def _render_result(result: BackupResult, console: Console) -> None:
     table = Table.grid(padding=(0, 2))
     table.add_column(no_wrap=True)
     table.add_column(overflow="fold")
-    table.add_row("Source", Text(result.source))
-    table.add_row("Output", Text(result.output))
+    table.add_row("Source", safe_text(result.source))
+    table.add_row("Output", safe_text(result.output))
     table.add_row("Files", str(result.file_count))
     table.add_row("Original size", f"{result.original_bytes:,} bytes")
     if result.archive:
-        table.add_row("Archive", Text(result.archive))
+        table.add_row("Archive", safe_text(result.archive))
         table.add_row("Compressed size", f"{result.compressed_bytes:,} bytes")
     table.add_row("Duration", f"{result.duration_seconds:.3f} s")
     title = "Backup preview — no files created" if result.dry_run else "Backup completed"
@@ -33,13 +33,13 @@ def _render_result(result: BackupResult, console: Console) -> None:
     if result.dry_run:
         console.print("Entries to include:", style="bold")
         for name in result.directories:
-            console.print(Text(f"  {name}/"))
+            console.print(safe_text(f"  {name}/"))
         for name in result.files:
-            console.print(Text(f"  {name}"))
+            console.print(safe_text(f"  {name}"))
     if result.skipped:
         console.print("Excluded by safety policy:", style="yellow")
         for entry in result.skipped:
-            console.print(Text(f"  {entry.path}: {entry.reason}", style="yellow"))
+            console.print(safe_text(f"  {entry.path}: {entry.reason}", style="yellow"))
 
 
 def backup(
@@ -79,7 +79,7 @@ def backup(
         if json_output:
             typer.echo(json.dumps({"success": False, "dry_run": dry_run, "error": str(exc)}))
         else:
-            Console(stderr=True).print(Text(str(exc), style="red"))
+            Console(stderr=True).print(safe_text(str(exc), style="red"))
         raise typer.Exit(code=1) from exc
     if json_output:
         typer.echo(json.dumps(asdict(result), allow_nan=False))

@@ -2,7 +2,6 @@
 
 import gzip
 import os
-import shutil
 import stat
 import tarfile
 import time
@@ -293,6 +292,56 @@ def _ensure_absent(parent_fd: int, name: str) -> None:
     raise RestoreError("Output must not already exist, even as an empty directory or link")
 
 
+def _verify_staging(
+    parent: int, name: str, identity: tuple[int, int] | None, descriptor: int | None
+) -> None:
+    """Compare a no-follow directory entry to its recorded and still-pinned inode.
+
+    This detects substitutions but is not an atomic check-and-rename/unlink.
+    In particular, it never authorizes recursive deletion by pathname.
+    """
+    if identity is None or descriptor is None:
+        raise RestoreError(f"Staging ownership could not be established: {name}")
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    pinned = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or not stat.S_ISDIR(pinned.st_mode)
+        or (current.st_dev, current.st_ino) != identity
+        or (pinned.st_dev, pinned.st_ino) != identity
+    ):
+        raise RestoreError(f"Staging identity changed; refusing operation on {name}")
+
+
+def _staging_residue(
+    parent: int,
+    name: str,
+    identity: tuple[int, int] | None,
+    descriptor: int | None,
+    requested_path: Path,
+) -> str:
+    """Prefer residues to deleting a tree that could be replaced after a check.
+
+    Even fd-based shutil.rmtree must resolve mutable child names and remove its
+    root by name. Without exclusive control over same-user writers, a stat then
+    rmtree is not ownership proof for the tree at deletion time. Do not delete
+    anything, including when identity verification fails. A renamed ancestor
+    may mean that requested_path no longer locates the original staging tree.
+    """
+    try:
+        _verify_staging(parent, name, identity, descriptor)
+    except (OSError, RestoreError) as exc:
+        return (
+            f"Cleanup refused: {exc}. No tree was removed; staging may remain under the "
+            f"opened output parent (requested staging path: {requested_path})"
+        )
+    return (
+        "Automatic cleanup withheld to avoid concurrent path-replacement races; "
+        "staging retained under the opened output parent "
+        f"(requested staging path: {requested_path})"
+    )
+
+
 def restore_backup(
     archive: Path,
     output: Path,
@@ -302,7 +351,15 @@ def restore_backup(
     max_bytes: int = DEFAULT_MAX_BYTES,
     progress: ProgressCallback | None = None,
 ) -> RestoreResult:
-    """Validate twice and publish one new directory atomically without replacement."""
+    """Validate twice and publish one new directory atomically without replacement.
+
+    Keep staging pinned and check its identity before and after publication.
+    On failure after staging creation, leave residues and report them rather
+    than attempt unsafe recursive cleanup. A check followed by rename is not
+    atomic with respect to source replacement: concurrent same-user writers
+    require external isolation. A detected publication race is an error and
+    neither the source nor destination tree is recursively deleted.
+    """
     started = time.monotonic()
     temporary = None
     try:
@@ -319,6 +376,8 @@ def restore_backup(
             _ensure_absent(parent, output.name)
             parent_identity = os.fstat(parent)
             fd = os.open(archive.name, _FILE_FLAGS, dir_fd=source_parent)
+            stage = None
+            stage_identity = None
             try:
                 original = os.fstat(fd)
                 if not stat.S_ISREG(original.st_mode):
@@ -333,11 +392,11 @@ def restore_backup(
                     temporary = None
                     os.mkdir(name, mode=0o700, dir_fd=parent)
                     temporary = name
+                    created = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+                    stage_identity = (created.st_dev, created.st_ino)
                     stage = os.open(temporary, _DIRECTORY_FLAGS, dir_fd=parent)
-                    try:
-                        prepared = _scan(fd, max_files, max_bytes, stage, progress)
-                    finally:
-                        os.close(stage)
+                    _verify_staging(parent, temporary, stage_identity, stage)
+                    prepared = _scan(fd, max_files, max_bytes, stage, progress)
                     if prepared != inventory or _signature(os.fstat(fd)) != _signature(original):
                         raise RestoreError("Archive changed during restoration")
                     with _output_parent(output.parent) as current_parent:
@@ -349,14 +408,28 @@ def restore_backup(
                         ):
                             raise RestoreError("Output parent changed during restoration")
                         _validate_output(parent)
+                        _verify_staging(parent, temporary, stage_identity, stage)
                         _rename_noreplace(parent, temporary, output.name)
+                        _verify_staging(parent, output.name, stage_identity, stage)
                     temporary = None
+            except BaseException as exc:
+                if temporary is not None:
+                    residue = _staging_residue(
+                        parent, temporary, stage_identity, stage, output.parent / temporary
+                    )
+                    reason = (
+                        "Restore interrupted by user"
+                        if isinstance(exc, KeyboardInterrupt)
+                        else (str(exc) or type(exc).__name__)
+                    )
+                    raise RestoreError(f"{reason}. {residue}") from exc
+                raise
             finally:
                 try:
-                    os.close(fd)
+                    if stage is not None:
+                        os.close(stage)
                 finally:
-                    if temporary is not None:
-                        shutil.rmtree(temporary, dir_fd=parent)
+                    os.close(fd)
         files, directories, total = inventory
         return RestoreResult(
             True,

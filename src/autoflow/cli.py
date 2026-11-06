@@ -12,6 +12,7 @@ from autoflow.commands.organize import organize
 from autoflow.commands.restore import restore
 from autoflow.commands.schedule import schedule
 from autoflow.commands.status import status
+from autoflow.presentation import safe_text
 
 app = typer.Typer(
     name="autoflow",
@@ -30,7 +31,7 @@ app.add_typer(schedule, name="schedule")
 
 def _show_version(value: bool) -> None:
     if value:
-        Console().print(f"[bold cyan]AutoFlow CLI[/bold cyan] {version('autoflow-cli')}")
+        Console().print("[bold cyan]AutoFlow CLI[/bold cyan]", safe_text(version("autoflow-cli")))
         raise typer.Exit()
 
 

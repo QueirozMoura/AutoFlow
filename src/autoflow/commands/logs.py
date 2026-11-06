@@ -9,7 +9,6 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 from autoflow.core.logs import (
     DEFAULT_MAX_BYTES,
@@ -22,6 +21,7 @@ from autoflow.core.logs import (
     analyze_stream,
 )
 from autoflow.integrations.journal import JournalError, open_journal, parse_journal
+from autoflow.presentation import safe_text
 
 
 def render_logs(result: LogsResult, console: Console) -> None:
@@ -29,7 +29,7 @@ def render_logs(result: LogsResult, console: Console) -> None:
     summary = Table.grid(padding=(0, 2))
     summary.add_column(no_wrap=True)
     summary.add_column(overflow="fold")
-    summary.add_row("Source", Text(result.source))
+    summary.add_row("Source", safe_text(result.source))
     summary.add_row("Analyzed lines", str(result.total_lines))
     summary.add_row("Read", f"{result.bytes_read:,} bytes")
     summary.add_row("Selected lines", str(result.selected_lines))
@@ -42,7 +42,7 @@ def render_logs(result: LogsResult, console: Console) -> None:
         "UNKNOWN": "white",
     }
     for level, count in result.severity_counts.items():
-        summary.add_row(Text(level, style=colors[level]), str(count))
+        summary.add_row(safe_text(level, style=colors[level]), str(count))
     console.print(Panel(summary, title="AutoFlow • Log analysis", border_style="cyan"))
     table = Table(title="Most frequent messages (sanitized templates)")
     table.add_column("Level", no_wrap=True)
@@ -50,19 +50,21 @@ def render_logs(result: LogsResult, console: Console) -> None:
     table.add_column("Message", overflow="fold")
     for group in result.groups:
         table.add_row(
-            Text(group.severity, style=colors[group.severity]),
+            safe_text(group.severity, style=colors[group.severity]),
             str(group.count),
-            Text(group.message),
+            safe_text(group.message),
         )
     console.print(table)
     if not result.groups:
         console.print("No matching messages.")
     if result.limited:
-        console.print(Text("Partial analysis: " + ", ".join(result.limit_reasons), style="yellow"))
+        console.print(
+            safe_text("Partial analysis: " + ", ".join(result.limit_reasons), style="yellow")
+        )
     if result.ungrouped_lines:
         console.print(f"Ungrouped selected lines: {result.ungrouped_lines}")
     for warning in result.warnings:
-        console.print(Text(warning, style="yellow"))
+        console.print(safe_text(warning, style="yellow"))
 
 
 def logs(
@@ -127,7 +129,7 @@ def logs(
         if json_output:
             typer.echo(json.dumps({"success": False, "error": str(exc)}))
         else:
-            Console(stderr=True).print(Text(str(exc), style="red"))
+            Console(stderr=True).print(safe_text(str(exc), style="red"))
         raise typer.Exit(1) from exc
     if json_output:
         typer.echo(json.dumps(asdict(result), allow_nan=False))

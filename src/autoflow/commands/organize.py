@@ -6,7 +6,6 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.table import Table
-from rich.text import Text
 
 from autoflow.core.organizer import (
     OrganizationPlan,
@@ -15,11 +14,7 @@ from autoflow.core.organizer import (
     execute_organization,
     plan_organization,
 )
-
-
-def _literal(value: str) -> Text:
-    """Keep markup literal and make unsafe display characters visible."""
-    return Text("".join(char if char.isprintable() else repr(char)[1:-1] for char in value))
+from autoflow.presentation import safe_text as _literal
 
 
 def render_plan(plan: OrganizationPlan, console: Console, *, dry_run: bool = True) -> None:

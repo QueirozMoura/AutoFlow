@@ -13,7 +13,6 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 from autoflow.core.backup import BackupError, _directory, _validate_output
 from autoflow.core.scheduler import (
@@ -24,6 +23,7 @@ from autoflow.core.scheduler import (
     plan_backup_schedule,
     user_unit_directory,
 )
+from autoflow.presentation import safe_text
 
 schedule = typer.Typer(help="Preview, install or explicitly activate backup schedules.")
 add = typer.Typer(help="Plan a new schedule and optionally install its unit files.")
@@ -64,26 +64,32 @@ def backup(
         plan = plan_backup_schedule(source, output, every.value)
         unit_directory = user_unit_directory() if install else None
     except (SchedulerError, OSError, RuntimeError) as exc:
-        Console(stderr=True).print(Text(str(exc), style="red"))
+        Console(stderr=True).print(safe_text(str(exc), style="red"))
         raise typer.Exit(code=1) from exc
 
     table = Table.grid(padding=(0, 2))
     table.add_column(no_wrap=True)
     table.add_column(overflow="fold")
-    table.add_row("Service", Text(plan.service.name))
-    table.add_row("Timer", Text(plan.timer.name))
-    table.add_row("Frequency", Text(plan.frequency))
-    table.add_row("Source", Text(str(plan.source)))
-    table.add_row("Output", Text(str(plan.output)))
-    table.add_row("Scope", Text(plan.scope))
-    table.add_row("Command", Text(shlex.join(plan.command)))
+    table.add_row("Service", safe_text(plan.service.name))
+    table.add_row("Timer", safe_text(plan.timer.name))
+    table.add_row("Frequency", safe_text(plan.frequency))
+    table.add_row("Source", safe_text(str(plan.source)))
+    table.add_row("Output", safe_text(str(plan.output)))
+    table.add_row("Scope", safe_text(plan.scope))
+    table.add_row("Command", safe_text(shlex.join(plan.command)))
     if unit_directory is not None:
-        table.add_row("Unit directory", Text(str(unit_directory)))
+        table.add_row("Unit directory", safe_text(str(unit_directory)))
     console = Console()
     mode = "dry-run" if dry_run else "install"
     console.print(Panel(table, title=f"Backup schedule preview ({mode})", border_style="cyan"))
     for unit in (plan.service, plan.timer):
-        console.print(Panel(Text(unit.content), title=Text(unit.name), border_style="cyan"))
+        console.print(
+            Panel(
+                safe_text(unit.content, multiline=True),
+                title=safe_text(unit.name),
+                border_style="cyan",
+            )
+        )
     if dry_run:
         console.print(
             "Preview only. No files changed; no systemd units created, installed or activated."
@@ -107,13 +113,13 @@ def backup(
         errors = Console(stderr=True)
         errors.print("Schedule installation failed.", style="red")
         for error in result.errors:
-            errors.print(Text(error, style="red"))
+            errors.print(safe_text(error, style="red"))
         for path in result.paths:
-            errors.print(Text(f"File remaining after failed cleanup: {path}", style="yellow"))
+            errors.print(safe_text(f"File remaining after failed cleanup: {path}", style="yellow"))
         raise typer.Exit(code=1)
     console.print("Schedule files installed:", style="green")
     for path in result.paths:
-        console.print(Text(str(path)))
+        console.print(safe_text(str(path)))
     console.print("The timer is not active. No timers were enabled or started.")
 
 
@@ -204,7 +210,7 @@ def activate(
             ("Source", str(plan.source)),
             ("Output", str(plan.output)),
         ):
-            table.add_row(label, Text(value))
+            table.add_row(label, safe_text(value))
         console.print(Panel(table, title="Activate backup schedule", border_style="cyan"))
         console.print("This will enable and start the timer in the systemd user manager.")
         if not yes:
@@ -228,17 +234,17 @@ def activate(
         configparser.Error,
         KeyError,
     ) as exc:
-        Console(stderr=True).print(Text(f"Cannot activate schedule: {exc}", style="red"))
+        Console(stderr=True).print(safe_text(f"Cannot activate schedule: {exc}", style="red"))
         raise typer.Exit(code=1) from exc
     result = activate_backup_schedule(plan, unit_directory=directory)
     if not result.success:
         errors = Console(stderr=True)
-        errors.print(Text(f"Timer activation failed: {timer}", style="red"))
+        errors.print(safe_text(f"Timer activation failed: {timer}", style="red"))
         for error in result.errors:
-            errors.print(Text(error, style="red"))
+            errors.print(safe_text(error, style="red"))
         if result.partial_activation_possible:
             errors.print(
                 "Warning: the timer may be partially enabled and/or active.", style="yellow"
             )
         raise typer.Exit(code=1)
-    console.print(Text(f"Timer enabled and started: {result.timer}", style="green"))
+    console.print(safe_text(f"Timer enabled and started: {result.timer}", style="green"))

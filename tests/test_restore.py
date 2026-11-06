@@ -273,14 +273,15 @@ def test_preparation_failure_cleanup(
         def cancel(*args):
             raise KeyboardInterrupt
 
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(core.RestoreError, match="interrupted.*staging retained") as raised:
             core.restore_backup(backup, tmp_path / "restored", progress=cancel)
-        assert not list(tmp_path.glob(".autoflow-restore-*"))
+        assert isinstance(raised.value.__cause__, KeyboardInterrupt)
+        assert len(list(tmp_path.glob(".autoflow-restore-*"))) == 1
         return
-    with pytest.raises(core.RestoreError):
+    with pytest.raises(core.RestoreError, match="staging retained"):
         core.restore_backup(backup, tmp_path / "restored")
     assert not (tmp_path / "restored").exists()
-    assert not list(tmp_path.glob(".autoflow-restore-*"))
+    assert len(list(tmp_path.glob(".autoflow-restore-*"))) == 1
 
 
 def test_publication_race_preserves_winner(
@@ -298,7 +299,7 @@ def test_publication_race_preserves_winner(
     with pytest.raises(core.RestoreError):
         core.restore_backup(backup, output)
     assert (output / "keep").read_text() == "winner"
-    assert not list(tmp_path.glob(".autoflow-restore-*"))
+    assert len(list(tmp_path.glob(".autoflow-restore-*"))) == 1
 
 
 def test_concurrent_restore(backup: Path, tmp_path: Path) -> None:
@@ -310,7 +311,10 @@ def test_concurrent_restore(backup: Path, tmp_path: Path) -> None:
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         assert sum(executor.map(attempt, range(3))) == 1
-    assert not list(tmp_path.glob(".autoflow-restore-*"))
+    residues = list(tmp_path.glob(".autoflow-restore-*"))
+    assert len(residues) <= 2
+    for residue in residues:
+        assert (residue / "source/hello.txt").read_bytes() == b"hello\n"
 
 
 def test_empty_archive_and_implicit_directories(tmp_path: Path) -> None:
@@ -337,7 +341,7 @@ def test_archive_changes_between_passes(
     monkeypatch.setattr(core, "_scan", change)
     with pytest.raises(core.RestoreError, match="changed"):
         core.restore_backup(backup, tmp_path / "restored")
-    assert not list(tmp_path.glob(".autoflow-restore-*"))
+    assert len(list(tmp_path.glob(".autoflow-restore-*"))) == 1
 
 
 def test_output_parent_moved_during_preparation(
@@ -357,7 +361,7 @@ def test_output_parent_moved_during_preparation(
     monkeypatch.setattr(core, "_scan", move)
     with pytest.raises(core.RestoreError, match="parent changed"):
         core.restore_backup(backup, parent / "restored")
-    assert not list((tmp_path / "moved").iterdir())
+    assert len(list((tmp_path / "moved").glob(".autoflow-restore-*"))) == 1
     assert not list(parent.iterdir())
 
 
@@ -435,11 +439,23 @@ def test_temporary_collision_preserves_unowned_directory(
 def test_cleanup_failure_is_explicit(
     backup: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    verify = core._verify_staging
+    calls = 0
+
+    def cleanup_denied(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PermissionError("cleanup identity check denied")
+        return verify(*args)
+
     with monkeypatch.context() as patch:
         patch.setattr(core.os, "fsync", Mock(side_effect=OSError("write failed")))
-        patch.setattr(core.shutil, "rmtree", Mock(side_effect=PermissionError("cleanup denied")))
-        with pytest.raises(core.RestoreError, match="cleanup denied"):
+        patch.setattr(core, "_verify_staging", cleanup_denied)
+        with pytest.raises(core.RestoreError, match="cleanup identity check denied") as raised:
             core.restore_backup(backup, tmp_path / "restored")
+        assert "write failed" in str(raised.value)
+        assert "Cleanup refused" in str(raised.value)
     assert not (tmp_path / "restored").exists()
     assert len(list(tmp_path.glob(".autoflow-restore-*"))) == 1
 
@@ -448,6 +464,193 @@ def test_missing_parent_not_created(backup: Path, tmp_path: Path) -> None:
     with pytest.raises(core.RestoreError):
         core.restore_backup(backup, tmp_path / "missing/restored", dry_run=True)
     assert not (tmp_path / "missing").exists()
+
+
+def test_staging_identity_is_pinned_through_publication(backup, tmp_path, monkeypatch):
+    verify = core._verify_staging
+    checks = []
+
+    def record(parent, name, identity, descriptor):
+        metadata = os.fstat(descriptor)
+        assert (metadata.st_dev, metadata.st_ino) == identity
+        checks.append(name)
+        return verify(parent, name, identity, descriptor)
+
+    monkeypatch.setattr(core, "_verify_staging", record)
+    result = core.restore_backup(backup, tmp_path / "restored")
+    assert result.success
+    assert len(checks) == 3
+    assert checks[0] == checks[1] and checks[0].startswith(".autoflow-restore-")
+    assert checks[2] == "restored"
+    assert not list(tmp_path.glob(".autoflow-restore-*"))
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink", "file", "missing"])
+def test_staging_substitution_refuses_publication_and_preserves_trees(
+    backup, tmp_path, monkeypatch, replacement
+):
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "keep.txt"
+    marker.write_bytes(b"external data")
+    before = marker.stat()
+    original_scan = core._scan
+    displaced = tmp_path / "original-staging"
+    staged = []
+
+    def substitute(*args, **kwargs):
+        result = original_scan(*args, **kwargs)
+        if args[3:]:
+            path = next(tmp_path.glob(".autoflow-restore-*"))
+            staged.append(path)
+            path.rename(displaced)
+            if replacement == "directory":
+                path.mkdir()
+                (path / "keep.txt").write_bytes(b"replacement data")
+            elif replacement == "symlink":
+                path.symlink_to(external, target_is_directory=True)
+            elif replacement == "file":
+                path.write_bytes(b"replacement file")
+        return result
+
+    monkeypatch.setattr(core, "_scan", substitute)
+    publisher = Mock(side_effect=AssertionError("substitute must not be published"))
+    monkeypatch.setattr(core, "_rename_noreplace", publisher)
+    monkeypatch.setattr(os, "unlink", Mock(side_effect=AssertionError("deletion attempted")))
+    monkeypatch.setattr(
+        os, "rmdir", Mock(side_effect=AssertionError("directory deletion attempted"))
+    )
+    with pytest.raises(core.RestoreError, match="Cleanup refused") as raised:
+        core.restore_backup(backup, tmp_path / "restored")
+    assert str(staged[0]) in str(raised.value)
+    publisher.assert_not_called()
+    assert not (tmp_path / "restored").exists()
+    assert (displaced / "source/hello.txt").read_bytes() == b"hello\n"
+    assert marker.read_bytes() == b"external data"
+    assert marker.stat().st_ino == before.st_ino and marker.stat().st_mtime_ns == before.st_mtime_ns
+    if replacement == "directory":
+        assert (staged[0] / "keep.txt").read_bytes() == b"replacement data"
+    elif replacement == "symlink":
+        assert staged[0].is_symlink() and staged[0].readlink() == external
+    elif replacement == "file":
+        assert staged[0].read_bytes() == b"replacement file"
+    else:
+        assert not staged[0].exists()
+
+
+@pytest.mark.parametrize("operation", ["stat", "open", "fstat"])
+def test_staging_identity_failures_retain_unverified_directory(
+    backup, tmp_path, monkeypatch, operation
+):
+    real_stat, real_open, real_fstat = os.stat, os.open, os.fstat
+    stage_fds = set()
+
+    def inspect(name, *args, **kwargs):
+        if isinstance(name, str) and name.startswith(".autoflow-restore-"):
+            assert kwargs.get("follow_symlinks") is False
+            if operation == "stat":
+                raise PermissionError("staging stat denied")
+        return real_stat(name, *args, **kwargs)
+
+    def open_stage(name, flags, *args, **kwargs):
+        staging = isinstance(name, str) and name.startswith(".autoflow-restore-")
+        if staging and operation == "open":
+            raise PermissionError("staging open denied")
+        descriptor = real_open(name, flags, *args, **kwargs)
+        if staging:
+            assert flags & os.O_NOFOLLOW and flags & os.O_DIRECTORY
+            stage_fds.add(descriptor)
+        return descriptor
+
+    def inspect_fd(descriptor):
+        if descriptor in stage_fds and operation == "fstat":
+            raise PermissionError("staging fstat denied")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(os, "stat", inspect)
+    monkeypatch.setattr(os, "open", open_stage)
+    monkeypatch.setattr(os, "fstat", inspect_fd)
+    with pytest.raises(core.RestoreError, match=f"staging {operation} denied") as raised:
+        core.restore_backup(backup, tmp_path / "restored")
+    assert "Cleanup refused" in str(raised.value)
+    assert not (tmp_path / "restored").exists()
+    assert len(list(tmp_path.glob(".autoflow-restore-*"))) == 1
+
+
+def test_substitution_between_creation_and_open_is_rejected(backup, tmp_path, monkeypatch):
+    real_open = os.open
+    displaced = tmp_path / "created-staging"
+    staged = []
+
+    def substitute(name, flags, *args, **kwargs):
+        if isinstance(name, str) and name.startswith(".autoflow-restore-"):
+            path = tmp_path / name
+            staged.append(path)
+            path.rename(displaced)
+            path.mkdir()
+            (path / "keep.txt").write_bytes(b"unowned staging")
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", substitute)
+    with pytest.raises(core.RestoreError, match="identity changed"):
+        core.restore_backup(backup, tmp_path / "restored")
+    assert not (tmp_path / "restored").exists()
+    assert list(displaced.iterdir()) == []
+    assert list(staged[0].iterdir()) == [staged[0] / "keep.txt"]
+    assert (staged[0] / "keep.txt").read_bytes() == b"unowned staging"
+
+
+def test_cleanup_does_not_delete_substitute_after_identity_check(backup, tmp_path, monkeypatch):
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "keep.txt").write_bytes(b"external data")
+    displaced = tmp_path / "owned-staging"
+    verify = core._verify_staging
+    calls = 0
+    substituted = []
+
+    def race(parent, name, identity, descriptor):
+        nonlocal calls
+        calls += 1
+        verify(parent, name, identity, descriptor)
+        if calls == 2:
+            # Initial verification is first; a write error leads directly to cleanup.
+            path = tmp_path / name
+            path.rename(displaced)
+            path.symlink_to(external, target_is_directory=True)
+            substituted.append(path)
+
+    monkeypatch.setattr(core, "_verify_staging", race)
+    monkeypatch.setattr(os, "fsync", Mock(side_effect=OSError("write failed")))
+    monkeypatch.setattr(os, "unlink", Mock(side_effect=AssertionError("deletion attempted")))
+    monkeypatch.setattr(
+        os, "rmdir", Mock(side_effect=AssertionError("directory deletion attempted"))
+    )
+    with pytest.raises(core.RestoreError, match="write failed.*staging retained"):
+        core.restore_backup(backup, tmp_path / "restored")
+    assert substituted[0].is_symlink()
+    assert displaced.is_dir()
+    assert (external / "keep.txt").read_bytes() == b"external data"
+
+
+def test_publication_detects_source_replaced_after_final_check(backup, tmp_path, monkeypatch):
+    real_publish = core._rename_noreplace
+    displaced = tmp_path / "owned-staging"
+    output = tmp_path / "restored"
+
+    def race(parent, temporary, final):
+        path = tmp_path / temporary
+        path.rename(displaced)
+        path.mkdir()
+        (path / "keep.txt").write_bytes(b"substitute tree")
+        real_publish(parent, temporary, final)
+
+    monkeypatch.setattr(core, "_rename_noreplace", race)
+    with pytest.raises(core.RestoreError, match="identity changed"):
+        core.restore_backup(backup, output)
+    # No success and no attempted deletion, including of a substitute moved by the race.
+    assert (output / "keep.txt").read_bytes() == b"substitute tree"
+    assert (displaced / "source/hello.txt").read_bytes() == b"hello\n"
 
 
 def test_archive_permissions_and_owners_are_not_applied(tmp_path: Path) -> None:
