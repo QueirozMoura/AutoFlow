@@ -5,10 +5,10 @@ administration, developed primarily in Python. It aims to provide a modular,
 maintainable command-line interface with readable terminal output and explicit
 control over operations that affect the system.
 
-**Status: system status, backup creation, and safe restoration.** Typer provides
-help, version, read-only `status`, `.tar.gz` backup creation, and validated
-restoration into new directories. Commands support Rich output and plain JSON.
-Scheduling and Bash integrations are not implemented.
+**Status: system status, backups, restoration, and log analysis.** Typer provides
+help, version, read-only `status`, `.tar.gz` backups, safe restoration into new
+directories, and bounded local file/systemd journal analysis. Commands support
+Rich output and plain JSON. Scheduling and Bash integrations are not implemented.
 
 ## Technology stack
 
@@ -38,9 +38,9 @@ versions will be verified as implementations and CI are added.
 │   └── autoflow/
 │       ├── __init__.py
 │       ├── cli.py        # Typer application and console entry point
-│       ├── commands/     # Status/backup/restore commands and terminal presentation
-│       ├── core/         # System metrics, thresholds, backup and restore operations
-│       └── integrations/ # Future Linux and process adapters
+│       ├── commands/     # Status/backup/restore/logs terminal presentation
+│       ├── core/         # System metrics, backup/restore, and log analysis
+│       └── integrations/ # Bounded journalctl adapter; future Linux adapters
 ├── tests/                # CLI interface tests
 ├── .gitignore
 ├── LICENSE
@@ -259,6 +259,112 @@ isolation against root or hostile processes with the same user credentials.
 SIGKILL or power loss may leave staging data; atomic publication does not promise
 full power-loss durability. No scheduling is included.
 
+## Log analysis
+
+```bash
+autoflow logs --file /caminho/arquivo.log
+autoflow logs --file /caminho/arquivo.log --errors
+autoflow logs --file /caminho/arquivo.log --json
+autoflow logs --journal --since 1h
+autoflow logs --file /caminho/arquivo.log --top 10
+autoflow logs --journal --since 30m --errors --json --timeout 20
+autoflow logs --file /caminho/arquivo.log --max-bytes 20971520 --max-lines 200000
+autoflow logs --help
+```
+
+Choose exactly one source: `--file` or `--journal`. Files must be regular files;
+symlinks, including symlink parent components, and special files are rejected.
+Files are opened read-only. No logs are modified or deleted; reading can update
+filesystem access times. UTF-8 decoding replaces invalid characters.
+
+The analyzer counts `ERROR`, `WARNING`, `INFO`, `DEBUG`, and `UNKNOWN` lines.
+Matching is case-insensitive and recognizes common variants: ERR, CRITICAL,
+FATAL, PANIC, ALERT, EMERG/EMERGENCY, SEVERE, EXCEPTION, FAIL/FAILED/FAILURE,
+WARN, NOTICE, INFORMATIONAL, and TRACE. Journal `PRIORITY` and syslog `<PRI>`
+take precedence over text: priorities 0–3 map to ERROR, 4 to WARNING, 5–6 to
+INFO, and 7 to DEBUG. Otherwise the first recognized severity token is used.
+Missing timestamps or severity are allowed; blank lines count as UNKNOWN.
+Each physical file line or journal JSON record is analyzed independently.
+
+Similar messages are grouped by severity and normalized template. Common
+timestamps, syslog hostnames, numbers, UUIDs, and request/trace/transaction IDs
+are normalized. Counts sort descending, then by severity and template for stable
+ties. `--top` limits returned groups only; `--errors` selects ERROR groups,
+including fatal/critical equivalents, while preserving all-severity summary counts.
+
+For example, two ERROR lines with changing worker IDs and one WARNING and INFO
+line produce a summary equivalent to:
+
+```text
+Analyzed lines  4
+ERROR          2
+WARNING        1
+INFO           1
+DEBUG          0
+UNKNOWN        0
+
+ERROR    2    ERROR worker[<n>] connection refused
+WARNING  1    WARNING disk pressure
+INFO     1    INFO ready
+```
+
+Reports retain sanitized templates of at most 512 characters, not raw message
+examples. Recognized password/token/API-key/auth/cookie fields, authorization
+credentials, URLs, emails, IP addresses, and absolute file paths are masked;
+terminal escape/control and Unicode formatting characters are removed. This is
+best-effort privacy reduction, not guaranteed anonymization: unknown secrets,
+names, and application-specific formats may remain. Review reports before
+sharing them. Log data stays local and is never sent to an external service.
+
+Reading and memory limits are configurable:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `--max-bytes` | 10485760 (10 MiB) | Maximum consumed source bytes; journal bytes include JSON framing |
+| `--max-lines` | 100000 | Maximum analyzed lines/records |
+| `--max-line-bytes` | 65536 (64 KiB) | Stop before analyzing an oversized line; one lookahead byte is allowed within the byte budget |
+| `--max-groups` | 1000 | Maximum tracked distinct selected templates |
+| `--top` | 10 | Maximum groups returned/displayed |
+| `--timeout` | 10 seconds | Journal deadline; configurable from 0.1 to 3600 seconds |
+
+The analyzer streams the beginning of a file or interval in chronological
+journal order; it does not tail or follow. Normal file buffering can prefetch
+a small amount beyond the consumed prefix. An oversized or byte-cut line is
+not classified. Reaching a line/byte cap conservatively marks the result partial
+even if the cap coincides exactly with EOF. At the group cap, existing groups
+continue accumulating; new templates count toward `ungrouped_lines`. Rankings
+then cover only retained templates and may omit globally frequent messages.
+Inventory size and line buffers stay bounded by configured limits.
+
+`--journal` runs `journalctl` with an explicit argument list, no shell, no pager,
+no password prompts, and no sudo. `--since` accepts positive relative intervals
+such as `30m`, `1h`, or `2d` (units s/m/h/d/w); it defaults to `1h` and is rejected
+for file sources. Only MESSAGE and PRIORITY are retained from journal records.
+Stdout and stderr are drained concurrently; diagnostics are bounded to 64 KiB
+and their raw content is omitted. Missing executables, permission failures,
+nonzero exits, malformed records, and timeouts produce errors. Diagnostic output
+on a successful exit produces a generic warning: journal access can be limited
+to the current user's accessible records. No privileges are requested. Hitting
+a read limit cancels and reaps the child; its final exit status is unavailable
+and this is explicitly reported. Tests never query the real journal.
+
+JSON contains `success`, `source_kind`, `source`, `total_lines`, `bytes_read`,
+`severity_counts`, `selected_lines`, `groups` (`severity`, `message`, `count`),
+`limited`, `limit_reasons`, `ungrouped_lines`, `errors_only`, `top`, configured
+limits, `duration_seconds`, and `warnings`. It is a single plain JSON object
+without ANSI or extra messages. Successful analysis, including explicitly
+limited analysis, exits 0. Operational failures emit `success: false` and `error`
+and exit 1 without a misleading successful partial summary. Invalid CLI syntax
+retains Typer's usage errors and exit 2.
+
+Limitations: classification and grouping are heuristics and may merge distinct
+messages or miss application-specific severity formats. Multiline tracebacks
+are not reconstructed; compressed files and non-UTF-8 encodings are not decoded
+automatically. The input is not a snapshot: appends, rotation, or truncation during
+reading can change the observed prefix. The journal deadline bounds subprocess
+I/O; local file I/O on a stalled filesystem has no deadline. Configured caps bound
+work and memory, but do not impose a general CPU quota. No scheduling is included.
+
 ## Quality checks
 
 The package uses the `src/` layout; install it in the development environment
@@ -277,6 +383,9 @@ concurrent publication, change detection, permission errors, and failure cleanup
 Restore tests additionally cover hostile paths/types/PAX metadata, gzip and tar
 corruption, configurable limits, atomic publication races, restrictive permissions,
 cleanup failures, dry-run, and CLI integration using `tmp_path` only.
+Log tests use synthetic files/streams and mocked journalctl launches, covering
+classification, grouping, filters, privacy reduction, bounded reads, subprocess
+timeouts/cleanup, permission failures, JSON, and temporary-directory integration.
 CI workflows remain a future stage. Runtime dependencies and development tools are declared in
 `pyproject.toml`; reproducible dependency locking is deferred to the CI stage.
 
@@ -299,6 +408,7 @@ The ignore rules are a convenience, not a substitute for reviewing staged files.
 - [x] Introduce read-only system inspection and metrics with `status` and JSON output.
 - [x] Create safe file and directory backups, previews, and structured JSON results.
 - [x] Restore validated backups atomically into new directories with bounded resource usage.
+- [x] Analyze local logs and accessible systemd journals with bounded reads and sanitized reports.
 - [ ] Design scheduling in a separate stage.
 - [ ] Add carefully scoped automation and Bash integrations.
 - [ ] Document supported distributions, operational safeguards, and release procedures.

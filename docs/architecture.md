@@ -8,7 +8,8 @@ repository contains packaging configuration, documentation, reserved module
 boundaries, and a Typer application with help, version, and read-only `status`.
 Rich provides terminal presentation; JSON supports machine consumers. `backup`
 creates archives in an explicit destination. `restore` validates untrusted
-archives and publishes a new directory atomically. Scheduling is outside scope.
+archives and publishes a new directory atomically. `logs` analyzes local files
+and accessible systemd journal records without modifying them. Scheduling is outside scope.
 
 ## Module responsibilities
 
@@ -23,6 +24,9 @@ archives and publishes a new directory atomically. Scheduling is outside scope.
 | `src/autoflow/core/backup.py` | Discover safe entries, validate consistency, and create/publish archives |
 | `src/autoflow/commands/restore.py` | Parse restore limits, render progress/previews, and serialize results/errors |
 | `src/autoflow/core/restore.py` | Bound and validate untrusted archives, stage contents, and publish a new directory |
+| `src/autoflow/commands/logs.py` | Select log source, configure limits, and render Rich/JSON summaries |
+| `src/autoflow/core/logs.py` | Read regular files, interpret levels, sanitize templates, and aggregate bounded streams |
+| `src/autoflow/integrations/journal.py` | Validate journal queries and manage bounded journalctl subprocess I/O |
 | `src/autoflow/core/` | Own application rules, use cases, and adapter contracts |
 | `src/autoflow/integrations/` | Implement Linux, psutil, and external-process adapters |
 | `tests/` | Verify behavior with unit tests and controlled integration tests |
@@ -209,6 +213,70 @@ snapshot or a defense against root/same-credential attackers changing files,
 mounts, or permissions during execution. SIGKILL/power loss can leave staging;
 directory publication is atomic but full crash durability is not guaranteed.
 
+### Log analysis execution and trust boundaries
+
+`commands/logs.py` selects exactly one source and passes the same bounded
+analysis options to the core. `core/logs.py` separates file opening (`analyze_file`),
+stream consumption/aggregation (`analyze_stream`), severity interpretation
+(`severity`), and privacy/group template normalization (`normalize_message`).
+`LogEntry`, `MessageGroup`, and `LogsResult` are terminal-independent dataclasses.
+The journal adapter depends on these core contracts; the core never imports the
+subprocess adapter, Typer, or Rich.
+
+File input uses existing Linux no-follow descriptor traversal from `core/backup.py`.
+Only regular files are accepted, opened read-only. Iterative binary `readline`
+calls consume at most the configured byte prefix, with bounded line buffers and
+UTF-8 replacement decoding. Ordinary buffered file I/O can prefetch a small
+amount beyond consumed bytes. Defaults are 10 MiB, 100,000 lines, 64 KiB per line,
+1,000 selected groups, and top 10. A per-line overflow uses at most one lookahead
+byte within the total budget, stops analysis, and never groups the partial line.
+A byte-cut line is omitted. Caps conservatively mark a limited result, including
+when exactly aligned with EOF. No whole-file reads or line lists are retained.
+
+Structured journal priority wins over syslog PRI, followed by the first recognized
+textual severity token. Missing levels become UNKNOWN. Critical/fatal and priorities
+0–3 map to ERROR; priority 4 to WARNING, 5–6 to INFO, 7 to DEBUG. Text variants are
+documented in README. Counts always describe all analyzed lines; `--errors` affects
+only selected groups. Templates normalize common timestamps, syslog hostnames,
+numeric values, IDs, network addresses, paths, and credential fields; terminal
+escapes/control/format characters are stripped. Only sanitized templates, capped
+at 512 characters, enter group storage. Redaction is best effort, not a promise of
+complete anonymization. No raw samples, journal diagnostic text, or remote
+transmission are part of the report.
+
+Groups use `(severity, template)` keys and deterministic count/severity/template
+sorting. At the group cap, tracked counts continue updating and new templates
+increment `ungrouped_lines`; results explicitly mark `max_groups` and cannot claim
+an exact global top ranking. `--top` only slices the final bounded ranking.
+
+`integrations/journal.py` validates positive relative s/m/h/d/w intervals, translating
+`1h` to `--since=-1h`. It invokes `Popen` with an argument list, `shell=False`,
+DEVNULL stdin, no pager or password prompts, and JSON output restricted to MESSAGE
+and PRIORITY (mandatory journal metadata may still be emitted but is discarded).
+MESSAGE may be a UTF-8 string or byte array; malformed records fail without echoing
+their content. The adapter never requests sudo or retries with higher privileges.
+
+`JournalReader` exposes bounded `readline` to the core. Nonblocking pipes and a
+selector consume stdout and stderr concurrently under a monotonic deadline
+(default 10 seconds). Stderr is counted, not retained, and capped at 64 KiB.
+Nonzero exits and startup/permission/timeout failures abort analysis. Successful
+stderr produces a generic warning about potentially restricted visibility.
+When core read limits stop before EOF, the child is killed and reaped; the report
+states that the final exit status is unavailable. Context-manager cleanup also
+runs on analysis errors or interruption. No real journal is read in tests.
+
+JSON emits one unformatted object with counts, selected ranked groups, configured
+limits, consumed bytes, duration, warnings, and explicit limitation reasons.
+Operational errors emit `success: false`/`error` and exit 1. Successful complete or
+explicitly limited analyses exit 0; Typer syntax errors retain code 2. Rich renders
+counts, sanitized templates, and visible partial-analysis warnings, never raw logs.
+
+This is a prefix analysis, not tail/follow or a snapshot. Rotation, truncation,
+and appends can change what is observed. Multiline records are not reconstructed;
+severity and normalization remain heuristics. Read/group caps bound memory/work
+but provide no CPU quota or local-filesystem I/O deadline. Journal visibility
+depends on the invoking user's existing permissions.
+
 ### Future process integrations
 
 Prefer Python APIs for portable, testable operations. Introduce Bash only when
@@ -245,6 +313,11 @@ Restore unit and CLI tests add hostile member paths/types, metadata-size attacks
 PAX overrides, archive/gzip corruption, limits, concurrent publication, original
 integrity, permission policy, and failure/cancellation cleanup. End-to-end tests
 create backups and restore them using only `tmp_path` resources.
+Log tests create synthetic temporary files and in-memory streams. Journal tests
+replace journalctl launches with controlled synthetic child processes, exercising
+real pipe draining, deadlines, early cancellation, error exits, and cleanup while
+never reading the host journal. CLI integration checks piped JSON and verifies the
+synthetic source content, mode, and modification time remain intact.
 
 Ruff is configured in `pyproject.toml` for linting and formatting with a Python
 3.12 target. Future CI will run lint, format checks, and meaningful tests on Linux
@@ -253,7 +326,7 @@ with a documented Python version matrix. Empty directories are tracked with
 
 ## Staged evolution
 
-The CLI foundation, read-only status snapshot, safe backup creation and restoration with
+The CLI foundation, read-only status snapshot, safe backup creation/restoration and log analysis with
 temporary-fixture tests are in place. Next add CI checks and define further
 command contracts; scheduling requires a separate design stage.
 Introduce automation only after adapter boundaries and operational
